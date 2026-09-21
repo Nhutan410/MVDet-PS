@@ -152,7 +152,8 @@ def main(args):
     test_moda_s = []
 
     trainer = PerspectiveTrainer(model, criterion, logdir, denormalize, args.cls_thres, args.alpha,
-                                 mal_warmup_epochs=args.mal_warmup_epochs, aux_optimizer=aux_optimizer)
+                                 mal_warmup_epochs=args.mal_warmup_epochs, aux_optimizer=aux_optimizer,
+                                 clip_grad_norm=args.clip_grad_norm)
 
     # learn
     if args.resume is None:
@@ -207,6 +208,9 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument('--seed', type=int, default=1, help='random seed (default: None)')
+    parser.add_argument('--clip_grad_norm', type=float, default=0.0,
+                        help='max grad norm of the main-branch parameters; 0 = off (original MVDet). '
+                             'Non-finite loss/gradient steps are always skipped and reported.')
 
     # Confuse-region heatmap loss, adapted from the BRL idea in
     # duclld1709/multiview-pedestrian-detection (Background Recalibration Loss) -- keeps the

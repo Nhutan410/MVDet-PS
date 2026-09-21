@@ -22,7 +22,7 @@ class BaseTrainer(object):
 
 class PerspectiveTrainer(BaseTrainer):
     def __init__(self, model, criterion, logdir, denormalize, cls_thres=0.4, alpha=1.0,
-                 mal_warmup_epochs=0, aux_optimizer=None):
+                 mal_warmup_epochs=0, aux_optimizer=None, clip_grad_norm=0.0):
         super(BaseTrainer, self).__init__()
         self.model = model
         self.criterion = criterion
@@ -35,6 +35,8 @@ class PerspectiveTrainer(BaseTrainer):
         self.is_mal = isinstance(criterion, MissingAnnotationLoss)
         self.mal_warmup_epochs = mal_warmup_epochs
         self.aux_optimizer = aux_optimizer
+        # 0 = off (original MVDet). Applied to the main-branch parameters only, after the NaN guard.
+        self.clip_grad_norm = clip_grad_norm
         self.img_criterion = GaussianMSE()  # per-view head/foot loss is always the original one
 
     def _forward(self, data):
@@ -67,6 +69,7 @@ class PerspectiveTrainer(BaseTrainer):
         active = self.is_mal and epoch > self.mal_warmup_epochs
         comp_s = {k: AverageMeter() for k in ['map', 'q', 's', 's_pos', 's_neg', 'prior', 'q_bg_mean', 'c_bg_mean', 'c_mean']}
         q_hist = torch.zeros(10)
+        n_skipped = 0
         if self.is_mal:
             print(f'[mal] epoch {epoch}: L_conf/L_q {"ACTIVE" if active else "OFF (warm-up, plain GaussianMSE)"}; '
                   f'L_s on')
@@ -83,6 +86,24 @@ class PerspectiveTrainer(BaseTrainer):
             t_forward += t_f - t_b
             loss, comp = self._loss(map_res, imgs_res, mal_out, map_gt, imgs_gt, data_loader.dataset, active)
             loss.backward()
+            # NaN guard: a single non-finite loss / gradient would poison the weights for the rest of
+            # the run, so skip this step (both optimizers) and report it instead of silently stepping.
+            main_params = [p for g in optimizer.param_groups for p in g['params']]
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                main_params, self.clip_grad_norm if self.clip_grad_norm > 0 else float('inf'))
+            if not torch.isfinite(loss) or not torch.isfinite(grad_norm):
+                n_skipped += 1
+                if n_skipped <= 5 or n_skipped % 50 == 0:
+                    print(f'[nan-guard] epoch {epoch} batch {batch_idx + 1}: loss={loss.item():.4g}, '
+                          f'grad_norm={grad_norm.item():.4g}, maxima={map_res.max().item():.4g}'
+                          + (f', L_map={comp["map"].item():.4g}, L_q={comp["q"].item():.4g}, '
+                             f'L_s={comp["s"].item():.4g}' if comp is not None else '')
+                          + ' -> step skipped')
+                optimizer.zero_grad()
+                if self.aux_optimizer is not None:
+                    self.aux_optimizer.zero_grad()
+                t_b = time.time()
+                continue
             optimizer.step()
             if self.aux_optimizer is not None:
                 self.aux_optimizer.step()
@@ -126,6 +147,9 @@ class PerspectiveTrainer(BaseTrainer):
               'Precision: {:.1f}%, Recall: {:.1f}%, Time: {:.3f}'.format(
             epoch, len(data_loader), losses / len(data_loader), precision_s.avg * 100, recall_s.avg * 100, t_epoch)
               + self._mal_str(comp_s))
+        if n_skipped:
+            print(f'[nan-guard] epoch {epoch}: {n_skipped}/{len(data_loader)} steps skipped because of '
+                  f'non-finite loss/gradients -- if this is most of the epoch the weights are already NaN')
         if torch.cuda.is_available():
             print('GPU peak memory this epoch: ' + ', '.join(
                 f'cuda:{i} {torch.cuda.max_memory_allocated(i) / 2 ** 30:.2f} GB' for i in range(torch.cuda.device_count())))
