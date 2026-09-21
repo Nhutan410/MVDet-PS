@@ -86,6 +86,7 @@ image ──► evidence backbone ──► s_v ──► warp ──► consens
 | `s_v_backbone` | `--mal_ev_backbone` | `frozen_dinov2` (`separate_trainable` = own ResNet-18) |
 | — | `--mal_dino_name`, `--mal_dino_input H W` | `dinov2_vits14`, `504 896` (multiples of 14) |
 | — | `--mal_aux_lr` | 1e-3 |
+| — | `--mal_ev_device` | `auto` (= GPU of `base_pt1`) |
 | — | `--mal_conf_grad_q` | off |
 
 Every term can be switched off independently for ablations: `--mal_lambda_q 0` leaves `q` at its
@@ -122,7 +123,25 @@ init (≈ 0.02 ⇒ practically the baseline), `--mal_lambda_s 0` stops `s_v` fro
 4. **Per-view head/foot loss of MVDet is unchanged** — the spec covers only the BEV map.
 5. **Chebyshev → Euclidean**: the "far" test uses a Euclidean disk of radius `min_dist_easy_neg`.
 
-## 6. Local CPU smoke test
+## 6. Device layout (1 or 2 GPUs)
+
+`PerspTransDetector` decides at construction time from `torch.cuda.device_count()`; do **not** set
+`CUDA_VISIBLE_DEVICES=0` if you want both Kaggle T4s.
+
+| | 2 GPUs (Kaggle T4 x2) | 1 GPU | no CUDA |
+|---|---|---|---|
+| `base_pt1` (ResNet layers 1-3, high-res activations) | `cuda:1` | `cuda:0` | `cpu` |
+| **evidence branch `s_v`** (DINOv2 / own ResNet + head) | `cuda:1` (`--mal_ev_device auto`) | `cuda:0` | `cpu` |
+| `base_pt2`, `img_classifier`, warp, `map_classifier`, gate `q`, consensus `c` | `cuda:0` | `cuda:0` | `cpu` |
+
+The evidence branch shares nothing with the main branch, so on 2 GPUs its forward/backward on
+`cuda:1` overlaps with the main branch on `cuda:0`; `s_logits` stay on `cuda:1` (L_s is computed
+there and moved next to `L_map` before summing), `c` is moved to `cuda:0` next to `q`. The epoch
+summary prints `GPU peak memory this epoch: cuda:0 … cuda:1 …`. `--mal_ev_device cuda:N` overrides
+the placement. The cross-device path was verified locally with the main branch on CPU and the
+evidence branch on Apple MPS (identical losses to the single-device run).
+
+## 7. Local CPU smoke test
 
 `PerspTransDetector` falls back to CPU when no CUDA device exists, so the whole `main.py` path can
 be exercised on a laptop (2-frame dataset, ~20 s / iteration on an M4 Pro). Real training is done on

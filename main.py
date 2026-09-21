@@ -30,7 +30,7 @@ def build_mal_cfg(args):
         return None
     return {'s_v_backbone': args.mal_ev_backbone, 'consensus_agg': args.mal_consensus,
             'min_visible_views': args.mal_min_visible_views, 'dino_name': args.mal_dino_name,
-            'dino_input': tuple(args.mal_dino_input)}
+            'dino_input': tuple(args.mal_dino_input), 'ev_device': args.mal_ev_device}
 
 
 def build_criterion(args, model=None):
@@ -247,6 +247,9 @@ if __name__ == '__main__':
                         choices=['frozen_dinov2', 'separate_trainable'],
                         help='backbone of the evidence branch s_v (never shared with the main backbone)')
     parser.add_argument('--mal_aux_lr', type=float, default=1e-3, help='Adam lr of the evidence branch + gate head')
+    parser.add_argument('--mal_ev_device', type=str, default='auto',
+                        help='device of the evidence branch: auto = same GPU as base_pt1 (cuda:1 when 2 GPUs are '
+                             'visible, else cuda:0), or an explicit cuda:N')
     parser.add_argument('--mal_dino_name', type=str, default='dinov2_vits14',
                         help='torch.hub facebookresearch/dinov2 model for --mal_ev_backbone frozen_dinov2')
     parser.add_argument('--mal_dino_input', type=int, nargs=2, default=[504, 896],

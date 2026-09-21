@@ -18,7 +18,14 @@ class PerspTransDetector(nn.Module):
         """
         mal_cfg: None -> original MVDet. Otherwise a dict enabling the missing-annotation branches:
             s_v_backbone ('frozen_dinov2' | 'separate_trainable'), consensus_agg, min_visible_views,
-            dino_name, dino_input -- see multiview_detector/models/missing_annotation.py.
+            dino_name, dino_input, ev_device -- see multiview_detector/models/missing_annotation.py.
+
+        Device layout (2 GPUs, e.g. Kaggle T4 x2):
+            cuda:1  base_pt1 (ResNet layers 1-3, the high-resolution activations)
+                    + the whole evidence branch s_v (own backbone + head)  <- ev_device='auto'
+            cuda:0  base_pt2, img_classifier, warp, map_classifier (heaviest), gate head, consensus
+        The evidence branch shares nothing with the main branch, so its forward on cuda:1 overlaps
+        with the main branch on cuda:0. With 1 GPU everything is on cuda:0; with no CUDA, on cpu.
         """
         super().__init__()
         # Original code hardcodes a 2-GPU split (backbone half on cuda:1, the rest on cuda:0) --
@@ -80,10 +87,14 @@ class PerspTransDetector(nn.Module):
         self.evidence = None
         if mal_cfg is not None:
             self.gate_head = GateHead(512).to(self.device_pt2)
+            ev_device = mal_cfg.get('ev_device', 'auto')
+            self.device_ev = self.device_pt1 if ev_device in (None, 'auto') else ev_device
             self.evidence = EvidenceBranch(backbone=mal_cfg.get('s_v_backbone', 'frozen_dinov2'),
                                            out_shape=self.upsample_shape,
                                            dino_name=mal_cfg.get('dino_name', 'dinov2_vits14'),
-                                           dino_input=mal_cfg.get('dino_input', (504, 896))).to(self.device_pt2)
+                                           dino_input=mal_cfg.get('dino_input', (504, 896))).to(self.device_ev)
+            print(f'[mal] devices: base_pt1 {self.device_pt1} | base_pt2 + map_classifier + gate {self.device_pt2} '
+                  f'| evidence branch {self.device_ev}')
             self.consensus_agg = mal_cfg.get('consensus_agg', 'median')
             self.min_visible_views = mal_cfg.get('min_visible_views', 2)
             self.register_buffer('visible_masks', compute_visibility_masks(dataset), persistent=False)
@@ -101,9 +112,12 @@ class PerspTransDetector(nn.Module):
         return self.evidence.trainable_parameters() + list(self.gate_head.parameters())
 
     def main_parameters(self):
-        """Everything the original MVDet SGD optimizer trains: all params except aux_parameters()."""
-        aux_ids = set(id(p) for p in self.aux_parameters())
-        return [p for p in self.parameters() if id(p) not in aux_ids]
+        """Everything the original MVDet SGD optimizer trains: all params except the evidence branch
+        (trainable or frozen) and the gate head."""
+        skip = set(id(p) for p in self.aux_parameters())
+        if self.evidence is not None:
+            skip |= set(id(p) for p in self.evidence.parameters())
+        return [p for p in self.parameters() if id(p) not in skip]
 
     def project_bev_to_views(self, bev_map, view_shape=None):
         return project_bev_to_views(bev_map.to(self.device_pt2), self.proj_mats_inv,
@@ -130,8 +144,9 @@ class PerspTransDetector(nn.Module):
                 plt.show()
             world_features.append(world_feature.to(self.device_pt2))
             if self.evidence is not None:
-                # independent branch: raw image in, evidence logits out; nothing shared with base_pt*
-                s_logits.append(self.evidence(imgs[:, cam].to(self.device_pt2)))
+                # independent branch: raw image in, evidence logits out; nothing shared with base_pt*.
+                # Runs on device_ev (cuda:1 with 2 GPUs) and overlaps with the main branch on cuda:0.
+                s_logits.append(self.evidence(imgs[:, cam].to(self.device_ev)))
 
         world_features = torch.cat(world_features + [self.coord_map.repeat([B, 1, 1, 1]).to(self.device_pt2)], dim=1)
         if visualize:
@@ -148,9 +163,11 @@ class PerspTransDetector(nn.Module):
             return map_result, imgs_result
 
         q = self.gate_head(map_trunk, self.reducedgrid_shape)
-        # same homographies as the features (proj_mats reuse), applied to the evidence probabilities
-        s_bev = project_views_to_bev([torch.sigmoid(s.detach()) for s in s_logits], self.proj_mats,
-                                     self.reducedgrid_shape)  # [B, N, X, Y]
+        # same homographies as the features (proj_mats reuse), applied to the evidence probabilities;
+        # consensus lives on device_pt2 next to q (L_q = (q - c)^2). s_logits stay on device_ev: the
+        # evidence loss L_s is computed there and its masks are moved over inside the loss.
+        s_bev = project_views_to_bev([torch.sigmoid(s.detach()).to(self.device_pt2) for s in s_logits],
+                                     self.proj_mats, self.reducedgrid_shape)  # [B, N, X, Y]
         c, n_vis = aggregate_consensus(s_bev, self.visible_masks, self.consensus_agg, self.min_visible_views)
         mal_out = {'q': q, 'c': c, 's_logits': s_logits, 's_bev': s_bev, 'n_vis': n_vis}
         return map_result, imgs_result, mal_out

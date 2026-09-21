@@ -107,6 +107,8 @@ class MissingAnnotationLoss(nn.Module):
             l_q, l_prior = zero, zero
 
         l_s_pos, l_s_neg = self.evidence_loss(mal_out['s_logits'], imgs_gt, img_kernel, map_gt)
+        # the evidence branch may live on another GPU: bring its loss next to L_map before summing
+        l_s_pos, l_s_neg = l_s_pos.to(map_res.device), l_s_neg.to(map_res.device)
         l_s = l_s_pos + l_s_neg
 
         total = l_map + self.lambda_q * l_q + self.lambda_s * l_s + self.lambda_prior * l_prior

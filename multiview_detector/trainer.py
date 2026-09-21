@@ -126,6 +126,11 @@ class PerspectiveTrainer(BaseTrainer):
               'Precision: {:.1f}%, Recall: {:.1f}%, Time: {:.3f}'.format(
             epoch, len(data_loader), losses / len(data_loader), precision_s.avg * 100, recall_s.avg * 100, t_epoch)
               + self._mal_str(comp_s))
+        if torch.cuda.is_available():
+            print('GPU peak memory this epoch: ' + ', '.join(
+                f'cuda:{i} {torch.cuda.max_memory_allocated(i) / 2 ** 30:.2f} GB' for i in range(torch.cuda.device_count())))
+            for i in range(torch.cuda.device_count()):
+                torch.cuda.reset_peak_memory_stats(i)
         if self.is_mal:
             hist = (q_hist / q_hist.sum().clamp_min(1)).tolist()
             print('[mal] epoch {} q histogram (10 bins on [0,1], fraction of BEV cells): {}'.format(
