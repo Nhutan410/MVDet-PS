@@ -6,19 +6,31 @@ import torch.nn.functional as F
 from kornia.geometry.transform import warp_perspective
 from torchvision.models.vgg import vgg11
 from multiview_detector.models.resnet import resnet18
+from multiview_detector.models.missing_annotation import (EvidenceBranch, GateHead, compute_visibility_masks,
+                                                          aggregate_consensus, project_views_to_bev,
+                                                          project_bev_to_views)
 
 import matplotlib.pyplot as plt
 
 
 class PerspTransDetector(nn.Module):
-    def __init__(self, dataset, arch='resnet18'):
+    def __init__(self, dataset, arch='resnet18', mal_cfg=None):
+        """
+        mal_cfg: None -> original MVDet. Otherwise a dict enabling the missing-annotation branches:
+            s_v_backbone ('frozen_dinov2' | 'separate_trainable'), consensus_agg, min_visible_views,
+            dino_name, dino_input -- see multiview_detector/models/missing_annotation.py.
+        """
         super().__init__()
         # Original code hardcodes a 2-GPU split (backbone half on cuda:1, the rest on cuda:0) --
         # a VRAM workaround from the original paper's hardware, not a correctness requirement.
         # Colab (and some Kaggle sessions) only expose 1 GPU, so fall back to putting everything
         # on cuda:0 there; keeps the original 2-GPU split when a second GPU is actually available.
-        self.device_pt1 = 'cuda:1' if torch.cuda.device_count() >= 2 else 'cuda:0'
-        self.device_pt2 = 'cuda:0'
+        # No CUDA at all (local CPU smoke tests) -> everything on cpu.
+        if torch.cuda.is_available():
+            self.device_pt1 = 'cuda:1' if torch.cuda.device_count() >= 2 else 'cuda:0'
+            self.device_pt2 = 'cuda:0'
+        else:
+            self.device_pt1 = self.device_pt2 = 'cpu'
         self.num_cam = dataset.num_cam
         self.img_shape, self.reducedgrid_shape = dataset.img_shape, dataset.reducedgrid_shape
         imgcoord2worldgrid_matrices = self.get_imgcoord2worldgrid_matrices(dataset.base.intrinsic_matrices,
@@ -34,6 +46,8 @@ class PerspTransDetector(nn.Module):
         # projection matrices: img feat -> map feat
         self.proj_mats = [torch.from_numpy(map_zoom_mat @ imgcoord2worldgrid_matrices[cam] @ img_zoom_mat)
                           for cam in range(self.num_cam)]
+        # map feat -> img feat (used to warp BEV masks into each view for the evidence loss)
+        self.proj_mats_inv = [torch.linalg.inv(M) for M in self.proj_mats]
 
         if arch == 'vgg11':
             base = vgg11().features
@@ -58,13 +72,49 @@ class PerspTransDetector(nn.Module):
                                             # nn.Conv2d(512, 512, 5, 1, 2), nn.ReLU(),
                                             nn.Conv2d(512, 512, 3, padding=2, dilation=2), nn.ReLU(),
                                             nn.Conv2d(512, 1, 3, padding=4, dilation=4, bias=False)).to(self.device_pt2)
+
+        # Missing-annotation branches (MISSING_ANNOTATION_LOSS.md). map_classifier keeps its
+        # parameter names so checkpoints trained without them still load with strict=False.
+        self.mal_cfg = mal_cfg
+        self.gate_head = None
+        self.evidence = None
+        if mal_cfg is not None:
+            self.gate_head = GateHead(512).to(self.device_pt2)
+            self.evidence = EvidenceBranch(backbone=mal_cfg.get('s_v_backbone', 'frozen_dinov2'),
+                                           out_shape=self.upsample_shape,
+                                           dino_name=mal_cfg.get('dino_name', 'dinov2_vits14'),
+                                           dino_input=mal_cfg.get('dino_input', (504, 896))).to(self.device_pt2)
+            self.consensus_agg = mal_cfg.get('consensus_agg', 'median')
+            self.min_visible_views = mal_cfg.get('min_visible_views', 2)
+            self.register_buffer('visible_masks', compute_visibility_masks(dataset), persistent=False)
+            n_vis = self.visible_masks.sum(0).float()
+            print(f'[mal] visibility: mean {n_vis.mean():.2f} views / cell, '
+                  f'{(n_vis >= self.min_visible_views).float().mean() * 100:.1f}% of cells have >= '
+                  f'{self.min_visible_views} views')
         pass
+
+    def aux_parameters(self):
+        """Trainable params of the evidence branch + gate head. Both sit on graphs cut off from the
+        main branch (own backbone / detached trunk), so they get their own (Adam) optimizer."""
+        if self.evidence is None:
+            return []
+        return self.evidence.trainable_parameters() + list(self.gate_head.parameters())
+
+    def main_parameters(self):
+        """Everything the original MVDet SGD optimizer trains: all params except aux_parameters()."""
+        aux_ids = set(id(p) for p in self.aux_parameters())
+        return [p for p in self.parameters() if id(p) not in aux_ids]
+
+    def project_bev_to_views(self, bev_map, view_shape=None):
+        return project_bev_to_views(bev_map.to(self.device_pt2), self.proj_mats_inv,
+                                    self.upsample_shape if view_shape is None else list(view_shape))
 
     def forward(self, imgs, visualize=False):
         B, N, C, H, W = imgs.shape
         assert N == self.num_cam
         world_features = []
         imgs_result = []
+        s_logits = []
         for cam in range(self.num_cam):
             img_feature = self.base_pt1(imgs[:, cam].to(self.device_pt1))
             img_feature = self.base_pt2(img_feature.to(self.device_pt2))
@@ -79,18 +129,31 @@ class PerspTransDetector(nn.Module):
                 plt.imshow(torch.norm(world_feature[0].detach(), dim=0).cpu().numpy())
                 plt.show()
             world_features.append(world_feature.to(self.device_pt2))
+            if self.evidence is not None:
+                # independent branch: raw image in, evidence logits out; nothing shared with base_pt*
+                s_logits.append(self.evidence(imgs[:, cam].to(self.device_pt2)))
 
         world_features = torch.cat(world_features + [self.coord_map.repeat([B, 1, 1, 1]).to(self.device_pt2)], dim=1)
         if visualize:
             plt.imshow(torch.norm(world_features[0].detach(), dim=0).cpu().numpy())
             plt.show()
-        map_result = self.map_classifier(world_features.to(self.device_pt2))
+        map_trunk = self.map_classifier[:-1](world_features.to(self.device_pt2))
+        map_result = self.map_classifier[-1](map_trunk)
         map_result = F.interpolate(map_result, self.reducedgrid_shape, mode='bilinear')
 
         if visualize:
             plt.imshow(torch.norm(map_result[0].detach(), dim=0).cpu().numpy())
             plt.show()
-        return map_result, imgs_result
+        if self.evidence is None:
+            return map_result, imgs_result
+
+        q = self.gate_head(map_trunk, self.reducedgrid_shape)
+        # same homographies as the features (proj_mats reuse), applied to the evidence probabilities
+        s_bev = project_views_to_bev([torch.sigmoid(s.detach()) for s in s_logits], self.proj_mats,
+                                     self.reducedgrid_shape)  # [B, N, X, Y]
+        c, n_vis = aggregate_consensus(s_bev, self.visible_masks, self.consensus_agg, self.min_visible_views)
+        mal_out = {'q': q, 'c': c, 's_logits': s_logits, 's_bev': s_bev, 'n_vis': n_vis}
+        return map_result, imgs_result, mal_out
 
     def get_imgcoord2worldgrid_matrices(self, intrinsic_matrices, extrinsic_matrices, worldgrid2worldcoord_mat):
         projection_matrices = {}

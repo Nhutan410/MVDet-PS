@@ -13,6 +13,7 @@ import torchvision.transforms as T
 from multiview_detector.datasets import *
 from multiview_detector.loss.gaussian_mse import GaussianMSE
 from multiview_detector.loss.confuse_gaussian_mse import ConfuseGaussianMSE
+from multiview_detector.loss.missing_annotation_loss import MissingAnnotationLoss
 from multiview_detector.models.persp_trans_detector import PerspTransDetector
 from multiview_detector.models.image_proj_variant import ImageProjVariant
 from multiview_detector.models.res_proj_variant import ResProjVariant
@@ -23,7 +24,26 @@ from multiview_detector.utils.image_utils import img_color_denormalize
 from multiview_detector.trainer import PerspectiveTrainer
 
 
-def build_criterion(args):
+def build_mal_cfg(args):
+    """Model-side config of the missing-annotation branches (None -> original MVDet)."""
+    if args.loss != 'mal':
+        return None
+    return {'s_v_backbone': args.mal_ev_backbone, 'consensus_agg': args.mal_consensus,
+            'min_visible_views': args.mal_min_visible_views, 'dino_name': args.mal_dino_name,
+            'dino_input': tuple(args.mal_dino_input)}
+
+
+def build_criterion(args, model=None):
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'  # cpu only for local smoke tests
+    if args.loss == 'mal':
+        # missing-annotation robust loss -- see MISSING_ANNOTATION_LOSS.md and
+        # multiview_detector/loss/missing_annotation_loss.py. Needs the model for the BEV->view warp.
+        return MissingAnnotationLoss(
+            lambda_q=args.mal_lambda_q, lambda_s=args.mal_lambda_s,
+            lambda_prior=args.mal_lambda_prior, pi_prior=args.mal_pi_prior,
+            min_dist_easy_neg=args.mal_min_dist_easy_neg, conf_grad_q=args.mal_conf_grad_q,
+            project_bev_to_views=model.project_bev_to_views,
+        ).to(device)
     if args.loss == 'confuse_gaussian':
         # keeps the Gaussian soft target but uses no pos_thr gate --
         # see multiview_detector/loss/confuse_gaussian_mse.py docstring for how it protects
@@ -32,8 +52,8 @@ def build_criterion(args):
             confuse_pred_thr=args.brl_confuse_thr,
             beta=args.brl_beta,
             mirror=not args.brl_no_mirror,
-        ).cuda()
-    return GaussianMSE().cuda()
+        ).to(device)
+    return GaussianMSE().to(device)
 
 
 def main(args):
@@ -68,8 +88,10 @@ def main(args):
                                               num_workers=args.num_workers, pin_memory=True)
 
     # model
+    if args.loss == 'mal' and args.variant != 'default':
+        raise Exception('--loss mal needs the gate/evidence branches, only implemented in the default variant')
     if args.variant == 'default':
-        model = PerspTransDetector(train_set, args.arch)
+        model = PerspTransDetector(train_set, args.arch, mal_cfg=build_mal_cfg(args))
     elif args.variant == 'img_proj':
         model = ImageProjVariant(train_set, args.arch)
     elif args.variant == 'res_proj':
@@ -79,18 +101,33 @@ def main(args):
     else:
         raise Exception('no support for this variant')
 
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    main_params = model.main_parameters() if hasattr(model, 'main_parameters') else model.parameters()
+    optimizer = optim.SGD(main_params, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.lr, steps_per_epoch=len(train_loader),
                                                     epochs=args.epochs)
+    # evidence branch s_v + gate head q have their own optimizer: no parameter, no gradient shared with p
+    aux_optimizer = None
+    if args.loss == 'mal':
+        aux_params = model.aux_parameters()
+        print(f'[mal] aux optimizer (evidence {args.mal_ev_backbone} + gate head): '
+              f'{sum(p.numel() for p in aux_params)} params, Adam lr={args.mal_aux_lr}; main SGD excludes them')
+        aux_optimizer = optim.Adam(aux_params, lr=args.mal_aux_lr)
 
     # loss
-    criterion = build_criterion(args)
+    criterion = build_criterion(args, model)
 
     # logging
     if args.loss == 'confuse_gaussian':
         loss_tag = f'{args.loss}_b{args.brl_beta}_c{args.brl_confuse_thr}'
         if args.brl_no_mirror:
             loss_tag += '_nomirror'
+    elif args.loss == 'mal':
+        loss_tag = (f'mal_{args.mal_ev_backbone}_{args.mal_consensus}_w{args.mal_warmup_epochs}'
+                    f'_d{args.mal_min_dist_easy_neg}_lq{args.mal_lambda_q}_ls{args.mal_lambda_s}')
+        if args.mal_lambda_prior > 0:
+            loss_tag += f'_lp{args.mal_lambda_prior}_pi{args.mal_pi_prior}'
+        if args.mal_conf_grad_q:
+            loss_tag += '_gradq'
     else:
         loss_tag = 'mse'
     logdir = f'logs/{args.dataset}_frame/{loss_tag}/{args.variant}/' + datetime.datetime.today().strftime('%Y-%m-%d_%H-%M-%S') \
@@ -114,7 +151,8 @@ def main(args):
     test_prec_s = []
     test_moda_s = []
 
-    trainer = PerspectiveTrainer(model, criterion, logdir, denormalize, args.cls_thres, args.alpha)
+    trainer = PerspectiveTrainer(model, criterion, logdir, denormalize, args.cls_thres, args.alpha,
+                                 mal_warmup_epochs=args.mal_warmup_epochs, aux_optimizer=aux_optimizer)
 
     # learn
     if args.resume is None:
@@ -141,7 +179,7 @@ def main(args):
     else:
         resume_dir = f'logs/{args.dataset}_frame/{loss_tag}/{args.variant}/' + args.resume
         resume_fname = resume_dir + '/MultiviewDetector.pth'
-        model.load_state_dict(torch.load(resume_fname))
+        model.load_state_dict(torch.load(resume_fname), strict=(args.loss != 'mal'))
         model.eval()
     print('Test loaded model...')
     trainer.test(test_loader, os.path.join(logdir, 'test.txt'), train_set.gt_fpath, True)
@@ -176,15 +214,46 @@ if __name__ == '__main__':
     # pixels are protected: a confuse-candidate pixel (pred >= c) is blended continuously by
     # (1 - soft_gt) instead, so pixels near a KNOWN/KEPT person are auto-protected without any
     # extra threshold (see confuse_gaussian_mse.py docstring for the full derivation).
-    parser.add_argument('--loss', type=str, default='mse', choices=['confuse_gaussian', 'mse'],
+    parser.add_argument('--loss', type=str, default='mse', choices=['confuse_gaussian', 'mal', 'mse'],
                         help='confuse_gaussian = Gaussian target, no pos_thr gate, continuous '
-                             '(1 - soft_gt) blend for confuse pixels; mse = original GaussianMSE')
+                             '(1 - soft_gt) blend for confuse pixels; mal = missing-annotation robust loss '
+                             '(learned gate q anchored to independent multi-view evidence c, see '
+                             'MISSING_ANNOTATION_LOSS.md); mse = original GaussianMSE')
     parser.add_argument('--brl_confuse_thr', type=float, default=0.3,
                         help='pred threshold on background to mark confuse (possible missing GT)')
     parser.add_argument('--brl_beta', type=float, default=0.1,
                         help='weight / strength of confuse term')
     parser.add_argument('--brl_no_mirror', action='store_true',
                         help='if set, down-weight bg MSE on confuse instead of mirroring toward 1')
+    # Missing-annotation robust loss (--loss mal). Every term can be switched off independently for
+    # ablations: lambda_q=0 leaves q at its init (~0.02, i.e. nearly the baseline), lambda_s=0 stops
+    # the evidence branch from learning (c stays at its init), lambda_prior=0 disables L_prior.
+    parser.add_argument('--mal_warmup_epochs', type=int, default=3,
+                        help='epochs of plain GaussianMSE (q fixed at 0) before L_conf / L_q switch on')
+    parser.add_argument('--mal_min_dist_easy_neg', type=int, default=10,
+                        help='min distance (reduced BEV cells; Wildtrack: 1 cell = 10 cm) from every kept '
+                             'annotation for a pixel to count as easy negative for s_v; closer unlabeled '
+                             'cells are the confusion zone and are ignored by L_s')
+    parser.add_argument('--mal_consensus', type=str, default='median', choices=['median', 'percentile25', 'min'],
+                        help='how the projected per-view evidence is aggregated into c(x, y) (never mean)')
+    parser.add_argument('--mal_min_visible_views', type=int, default=2,
+                        help='cells seen by fewer cameras get c = 0 (no single-view inference)')
+    parser.add_argument('--mal_lambda_q', type=float, default=1.0, help='weight of L_q = (q - stopgrad(c))^2')
+    parser.add_argument('--mal_lambda_s', type=float, default=1.0, help='weight of the evidence loss L_s')
+    parser.add_argument('--mal_lambda_prior', type=float, default=0.0,
+                        help='weight of L_prior = (mean_bg(q) - pi)^2; 0 = off (L_q is the main anchor)')
+    parser.add_argument('--mal_pi_prior', type=float, default=0.0, help='estimated missing-label rate for L_prior')
+    parser.add_argument('--mal_ev_backbone', type=str, default='frozen_dinov2',
+                        choices=['frozen_dinov2', 'separate_trainable'],
+                        help='backbone of the evidence branch s_v (never shared with the main backbone)')
+    parser.add_argument('--mal_aux_lr', type=float, default=1e-3, help='Adam lr of the evidence branch + gate head')
+    parser.add_argument('--mal_dino_name', type=str, default='dinov2_vits14',
+                        help='torch.hub facebookresearch/dinov2 model for --mal_ev_backbone frozen_dinov2')
+    parser.add_argument('--mal_dino_input', type=int, nargs=2, default=[504, 896],
+                        help='H W the views are resized to before DINOv2 (multiples of 14)')
+    parser.add_argument('--mal_conf_grad_q', action='store_true',
+                        help='ABLATION ONLY: let L_conf backprop into q (default: q detached in L_conf, '
+                             'learned only from c via L_q -- the spec forbids self-judging)')
     args = parser.parse_args()
 
     main(args)

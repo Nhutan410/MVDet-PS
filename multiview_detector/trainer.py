@@ -1,4 +1,5 @@
 import time
+import json
 import torch
 import os
 import numpy as np
@@ -10,6 +11,8 @@ from multiview_detector.evaluation.evaluate import evaluate
 from multiview_detector.utils.nms import nms
 from multiview_detector.utils.meters import AverageMeter
 from multiview_detector.utils.image_utils import add_heatmap_to_image
+from multiview_detector.loss.gaussian_mse import GaussianMSE
+from multiview_detector.loss.missing_annotation_loss import MissingAnnotationLoss
 
 
 class BaseTrainer(object):
@@ -18,7 +21,8 @@ class BaseTrainer(object):
 
 
 class PerspectiveTrainer(BaseTrainer):
-    def __init__(self, model, criterion, logdir, denormalize, cls_thres=0.4, alpha=1.0):
+    def __init__(self, model, criterion, logdir, denormalize, cls_thres=0.4, alpha=1.0,
+                 mal_warmup_epochs=0, aux_optimizer=None):
         super(BaseTrainer, self).__init__()
         self.model = model
         self.criterion = criterion
@@ -26,28 +30,69 @@ class PerspectiveTrainer(BaseTrainer):
         self.logdir = logdir
         self.denormalize = denormalize
         self.alpha = alpha
+        # missing-annotation loss: L_conf / L_q switch on only after mal_warmup_epochs (train p alone
+        # first); evidence branch s_v + gate head q have their own optimizer, s_v trains from epoch 1
+        self.is_mal = isinstance(criterion, MissingAnnotationLoss)
+        self.mal_warmup_epochs = mal_warmup_epochs
+        self.aux_optimizer = aux_optimizer
+        self.img_criterion = GaussianMSE()  # per-view head/foot loss is always the original one
+
+    def _forward(self, data):
+        # model returns (map_res, imgs_res) or, with the missing-annotation branches, (map_res, imgs_res, mal_out)
+        out = self.model(data)
+        map_res, imgs_res = out[0], out[1]
+        mal_out = out[2] if len(out) > 2 else None
+        return map_res, imgs_res, mal_out
+
+    def _loss(self, map_res, imgs_res, mal_out, map_gt, imgs_gt, dataset, active=False):
+        """Returns (total_loss, components dict or None)."""
+        img_loss = 0
+        for img_res, img_gt in zip(imgs_res, imgs_gt):
+            img_loss += self.img_criterion(img_res, img_gt.to(img_res.device), dataset.img_kernel)
+        img_loss = img_loss / len(imgs_gt) * self.alpha
+        if not self.is_mal:
+            return self.criterion(map_res, map_gt.to(map_res.device), dataset.map_kernel) + img_loss, None
+        out = self.criterion(map_res, map_gt.to(map_res.device), dataset.map_kernel, imgs_gt, dataset.img_kernel,
+                             mal_out, active=active)
+        return out['total'] + img_loss, out
+
+    def _write_mal_stats(self, record):
+        with open(os.path.join(self.logdir, 'mal_stats.jsonl'), 'a') as f:
+            f.write(json.dumps(record) + '\n')
 
     def train(self, epoch, data_loader, optimizer, log_interval=100, cyclic_scheduler=None):
         self.model.train()
         losses = 0
         precision_s, recall_s = AverageMeter(), AverageMeter()
+        active = self.is_mal and epoch > self.mal_warmup_epochs
+        comp_s = {k: AverageMeter() for k in ['map', 'q', 's', 's_pos', 's_neg', 'prior', 'q_bg_mean', 'c_bg_mean', 'c_mean']}
+        q_hist = torch.zeros(10)
+        if self.is_mal:
+            print(f'[mal] epoch {epoch}: L_conf/L_q {"ACTIVE" if active else "OFF (warm-up, plain GaussianMSE)"}; '
+                  f'L_s on')
         t0 = time.time()
         t_b = time.time()
         t_forward = 0
         t_backward = 0
         for batch_idx, (data, map_gt, imgs_gt, _) in enumerate(data_loader):
             optimizer.zero_grad()
-            map_res, imgs_res = self.model(data)
+            if self.aux_optimizer is not None:
+                self.aux_optimizer.zero_grad()
+            map_res, imgs_res, mal_out = self._forward(data)
             t_f = time.time()
             t_forward += t_f - t_b
-            loss = 0
-            for img_res, img_gt in zip(imgs_res, imgs_gt):
-                loss += self.criterion(img_res, img_gt.to(img_res.device), data_loader.dataset.img_kernel)
-            loss = self.criterion(map_res, map_gt.to(map_res.device), data_loader.dataset.map_kernel) + \
-                   loss / len(imgs_gt) * self.alpha
+            loss, comp = self._loss(map_res, imgs_res, mal_out, map_gt, imgs_gt, data_loader.dataset, active)
             loss.backward()
             optimizer.step()
+            if self.aux_optimizer is not None:
+                self.aux_optimizer.step()
             losses += loss.item()
+            if comp is not None:
+                for k in ['map', 'q', 's', 's_pos', 's_neg', 'prior']:
+                    comp_s[k].update(comp[k].detach().item())
+                for k in ['q_bg_mean', 'c_bg_mean', 'c_mean']:
+                    comp_s[k].update(comp['stats'][k])
+                q_hist += comp['stats']['q_hist']
             pred = (map_res > self.cls_thres).int().to(map_gt.device)
             true_positive = (pred.eq(map_gt) * pred.eq(1)).sum().item()
             false_positive = pred.sum().item() - true_positive
@@ -72,16 +117,31 @@ class PerspectiveTrainer(BaseTrainer):
                 print('Train Epoch: {}, Batch:{}, Loss: {:.6f}, '
                       'prec: {:.1f}%, recall: {:.1f}%, Time: {:.1f} (f{:.3f}+b{:.3f}), maxima: {:.3f}'.format(
                     epoch, (batch_idx + 1), losses / (batch_idx + 1), precision_s.avg * 100, recall_s.avg * 100,
-                    t_epoch, t_forward / batch_idx, t_backward / batch_idx, map_res.max()))
+                    t_epoch, t_forward / max(batch_idx, 1), t_backward / max(batch_idx, 1), map_res.max()) + self._mal_str(comp_s))
                 pass
 
         t1 = time.time()
         t_epoch = t1 - t0
         print('Train Epoch: {}, Batch:{}, Loss: {:.6f}, '
               'Precision: {:.1f}%, Recall: {:.1f}%, Time: {:.3f}'.format(
-            epoch, len(data_loader), losses / len(data_loader), precision_s.avg * 100, recall_s.avg * 100, t_epoch))
+            epoch, len(data_loader), losses / len(data_loader), precision_s.avg * 100, recall_s.avg * 100, t_epoch)
+              + self._mal_str(comp_s))
+        if self.is_mal:
+            hist = (q_hist / q_hist.sum().clamp_min(1)).tolist()
+            print('[mal] epoch {} q histogram (10 bins on [0,1], fraction of BEV cells): {}'.format(
+                epoch, ' '.join(f'{h:.3f}' for h in hist)))
+            self._write_mal_stats({'epoch': epoch, 'active': active, 'loss': losses / len(data_loader),
+                                   **{k: m.avg for k, m in comp_s.items()}, 'q_hist': hist})
 
         return losses / len(data_loader), precision_s.avg * 100
+
+    def _mal_str(self, comp_s):
+        if not self.is_mal or comp_s['map'].count == 0:
+            return ''
+        return (', L_map: {:.5f}, L_q: {:.5f}, L_s: {:.4f} (pos {:.4f} / neg {:.4f}), '
+                'q_bg: {:.4f}, c_bg: {:.4f}, c: {:.4f}'.format(
+                    comp_s['map'].avg, comp_s['q'].avg, comp_s['s'].avg, comp_s['s_pos'].avg, comp_s['s_neg'].avg,
+                    comp_s['q_bg_mean'].avg, comp_s['c_bg_mean'].avg, comp_s['c_mean'].avg))
 
     def test(self, data_loader, res_fpath=None, gt_fpath=None, visualize=False):
         self.model.eval()
@@ -93,7 +153,7 @@ class PerspectiveTrainer(BaseTrainer):
             assert gt_fpath is not None
         for batch_idx, (data, map_gt, imgs_gt, frame) in enumerate(data_loader):
             with torch.no_grad():
-                map_res, imgs_res = self.model(data)
+                map_res, imgs_res, mal_out = self._forward(data)
             if res_fpath is not None:
                 map_grid_res = map_res.detach().cpu().squeeze()
                 v_s = map_grid_res[map_grid_res > self.cls_thres].unsqueeze(1)
@@ -105,11 +165,10 @@ class PerspectiveTrainer(BaseTrainer):
                 all_res_list.append(torch.cat([torch.ones_like(v_s) * frame, grid_xy.float() *
                                                data_loader.dataset.grid_reduce, v_s], dim=1))
 
-            loss = 0
-            for img_res, img_gt in zip(imgs_res, imgs_gt):
-                loss += self.criterion(img_res, img_gt.to(img_res.device), data_loader.dataset.img_kernel)
-            loss = self.criterion(map_res, map_gt.to(map_res.device), data_loader.dataset.map_kernel) + \
-                   loss / len(imgs_gt) * self.alpha
+            with torch.no_grad():
+                # test annotations are complete: report the plain GaussianMSE map loss (active=False)
+                # so the number stays comparable with the baseline
+                loss, _ = self._loss(map_res, imgs_res, mal_out, map_gt, imgs_gt, data_loader.dataset, active=False)
             losses += loss.item()
             pred = (map_res > self.cls_thres).int().to(map_gt.device)
             true_positive = (pred.eq(map_gt) * pred.eq(1)).sum().item()
@@ -124,14 +183,28 @@ class PerspectiveTrainer(BaseTrainer):
         t_epoch = t1 - t0
 
         if visualize:
-            fig = plt.figure()
-            subplt0 = fig.add_subplot(211, title="output")
-            subplt1 = fig.add_subplot(212, title="target")
+            n_rows = 4 if mal_out is not None else 2
+            fig = plt.figure(figsize=(6, 2.5 * n_rows))
+            subplt0 = fig.add_subplot(n_rows, 1, 1, title="output")
+            subplt1 = fig.add_subplot(n_rows, 1, 2, title="target")
             subplt0.imshow(map_res.cpu().detach().numpy().squeeze())
-            subplt1.imshow(self.criterion._traget_transform(map_res, map_gt, data_loader.dataset.map_kernel)
+            subplt1.imshow(self.criterion._traget_transform(map_res, map_gt.to(map_res.device),
+                                                            data_loader.dataset.map_kernel)
                            .cpu().detach().numpy().squeeze())
+            if mal_out is not None:
+                subplt2 = fig.add_subplot(n_rows, 1, 3, title="gate q")
+                subplt3 = fig.add_subplot(n_rows, 1, 4, title="multi-view evidence c")
+                subplt2.imshow(mal_out['q'][0, 0].cpu().numpy(), vmin=0, vmax=1)
+                subplt3.imshow(mal_out['c'][0, 0].cpu().numpy(), vmin=0, vmax=1)
+            plt.tight_layout()
             plt.savefig(os.path.join(self.logdir, 'map.jpg'))
             plt.close(fig)
+            if mal_out is not None:
+                # per-view evidence s_v of camera 1 on top of the image
+                s0 = torch.sigmoid(mal_out['s_logits'][0][0, 0]).detach().cpu().numpy()
+                img0 = self.denormalize(data[0, 0]).cpu().numpy().squeeze().transpose([1, 2, 0])
+                img0 = Image.fromarray((img0 * 255).astype('uint8'))
+                add_heatmap_to_image(s0, img0).save(os.path.join(self.logdir, 'cam1_evidence.jpg'))
 
             # visualizing the heatmap for per-view estimation
             heatmap0_head = imgs_res[0][0, 0].detach().cpu().numpy().squeeze()

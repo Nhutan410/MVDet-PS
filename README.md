@@ -1,3 +1,24 @@
+# MVDet-PS -- MVDet with a missing-annotation robust loss
+
+Copy of [`Nhutan410/MVDet`](https://github.com/Nhutan410/MVDet) (itself a fork of
+[hou-yz/MVDet](https://github.com/hou-yz/MVDet)) plus the **missing-annotation robust loss** `--loss mal`
+for partly-supervised training (some pedestrians have no label and are wrongly treated as background):
+
+* spec: [`SPEC_missing_annotation_loss.md`](SPEC_missing_annotation_loss.md)
+* implementation notes, config flags, what to monitor: [`MISSING_ANNOTATION_LOSS.md`](MISSING_ANNOTATION_LOSS.md)
+* code: `multiview_detector/loss/missing_annotation_loss.py`, `multiview_detector/models/missing_annotation.py`,
+  hooks in `persp_trans_detector.py`, `trainer.py`, `main.py`
+* tests: `python tests/test_missing_annotation_loss.py` (CPU, no data)
+
+```
+python main.py -d wildtrack --loss mse    # original MVDet, unchanged
+python main.py -d wildtrack --loss mal    # gate q anchored to independent multi-view evidence c (frozen DINOv2)
+```
+
+The original README follows.
+
+---
+
 # Multiview Detection with Feature Perspective Transformation [[Website](https://hou-yz.github.io/publication/2020-eccv2020-mvdet)] [[arXiv](https://arxiv.org/abs/2007.07247)]
 
 ```
