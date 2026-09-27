@@ -14,6 +14,7 @@ from multiview_detector.datasets import *
 from multiview_detector.loss.gaussian_mse import GaussianMSE
 from multiview_detector.loss.confuse_gaussian_mse import ConfuseGaussianMSE
 from multiview_detector.loss.missing_annotation_loss import MissingAnnotationLoss
+from multiview_detector.loss.pseudo_gaussian_mse import PseudoGaussianMSE, VARIANTS as PS_VARIANTS
 from multiview_detector.models.persp_trans_detector import PerspTransDetector
 from multiview_detector.models.image_proj_variant import ImageProjVariant
 from multiview_detector.models.res_proj_variant import ResProjVariant
@@ -33,8 +34,32 @@ def build_mal_cfg(args):
             'dino_input': tuple(args.mal_dino_input), 'ev_device': args.mal_ev_device}
 
 
+def ps_r_ignore(args):
+    return 1.5 * args.ps_r if args.ps_r_ignore < 0 else args.ps_r_ignore
+
+
+def pseudo_cfg(args):
+    return {'alpha': args.ps_alpha, 'alpha_const': args.ps_alpha_const, 'views_k': args.ps_views_k,
+            'min_score': args.ps_min_score, 'min_views': args.ps_min_views}
+
+
+def pseudo_tag(args):
+    tag = f'pseudo_{args.ps_variant}_r{args.ps_r:g}_ri{ps_r_ignore(args):g}_a{args.ps_alpha}'
+    if args.ps_alpha == 'const':
+        tag += f'{args.ps_alpha_const:g}'
+    tag += f'_l{args.ps_lambda:g}_w{args.ps_warmup}r{args.ps_ramp}'
+    if args.ps_min_score > 0:
+        tag += f'_ms{args.ps_min_score:g}'
+    if args.ps_min_views > 1:
+        tag += f'_mv{args.ps_min_views}'
+    return tag + '_' + os.path.basename(os.path.normpath(args.pseudo_dir))
+
+
 def build_criterion(args, model=None):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'  # cpu only for local smoke tests
+    if args.loss == 'pseudo':
+        # kept labels as in GaussianMSE + pseudo labels from a 2D detector -- see PSEUDO_LABEL.md
+        return PseudoGaussianMSE(variant=args.ps_variant, r=args.ps_r, r_ignore=ps_r_ignore(args)).to(device)
     if args.loss == 'mal':
         # missing-annotation robust loss -- see MISSING_ANNOTATION_LOSS.md and
         # multiview_detector/loss/missing_annotation_loss.py. Needs the model for the BEV->view warp.
@@ -79,7 +104,15 @@ def main(args):
         base = MultiviewX(data_path)
     else:
         raise Exception('must choose from [wildtrack, multiviewx]')
-    train_set = frameDataset(base, train=True, transform=train_trans, grid_reduce=4)
+    if args.loss == 'pseudo':
+        if args.pseudo_dir is None:
+            raise Exception('--loss pseudo needs --pseudo_dir (tools/pseudo/build_pseudo.py output)')
+        if args.batch_size != 1:
+            raise Exception('--loss pseudo: pseudo points differ in number per frame, use --batch_size 1')
+        train_set = frameDataset(base, train=True, transform=train_trans, grid_reduce=4,
+                                 pseudo_dir=os.path.expanduser(args.pseudo_dir), pseudo_cfg=pseudo_cfg(args))
+    else:
+        train_set = frameDataset(base, train=True, transform=train_trans, grid_reduce=4)
     test_set = frameDataset(base, train=False, transform=train_trans, grid_reduce=4)
 
     train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
@@ -128,6 +161,8 @@ def main(args):
             loss_tag += f'_lp{args.mal_lambda_prior}_pi{args.mal_pi_prior}'
         if args.mal_conf_grad_q:
             loss_tag += '_gradq'
+    elif args.loss == 'pseudo':
+        loss_tag = pseudo_tag(args)
     else:
         loss_tag = 'mse'
     logdir = f'logs/{args.dataset}_frame/{loss_tag}/{args.variant}/' + datetime.datetime.today().strftime('%Y-%m-%d_%H-%M-%S') \
@@ -153,7 +188,8 @@ def main(args):
 
     trainer = PerspectiveTrainer(model, criterion, logdir, denormalize, args.cls_thres, args.alpha,
                                  mal_warmup_epochs=args.mal_warmup_epochs, aux_optimizer=aux_optimizer,
-                                 clip_grad_norm=args.clip_grad_norm)
+                                 clip_grad_norm=args.clip_grad_norm,
+                                 ps_schedule=(args.ps_lambda, args.ps_warmup, args.ps_ramp))
 
     # learn
     if args.resume is None:
@@ -218,11 +254,12 @@ if __name__ == '__main__':
     # pixels are protected: a confuse-candidate pixel (pred >= c) is blended continuously by
     # (1 - soft_gt) instead, so pixels near a KNOWN/KEPT person are auto-protected without any
     # extra threshold (see confuse_gaussian_mse.py docstring for the full derivation).
-    parser.add_argument('--loss', type=str, default='mse', choices=['confuse_gaussian', 'mal', 'mse'],
+    parser.add_argument('--loss', type=str, default='mse', choices=['confuse_gaussian', 'mal', 'mse', 'pseudo'],
                         help='confuse_gaussian = Gaussian target, no pos_thr gate, continuous '
                              '(1 - soft_gt) blend for confuse pixels; mal = missing-annotation robust loss '
                              '(learned gate q anchored to independent multi-view evidence c, see '
-                             'MISSING_ANNOTATION_LOSS.md); mse = original GaussianMSE')
+                             'MISSING_ANNOTATION_LOSS.md); mse = original GaussianMSE; pseudo = GaussianMSE on '
+                             'the kept labels + pseudo labels from a 2D detector (PSEUDO_LABEL.md)')
     parser.add_argument('--brl_confuse_thr', type=float, default=0.3,
                         help='pred threshold on background to mark confuse (possible missing GT)')
     parser.add_argument('--brl_beta', type=float, default=0.1,
@@ -258,6 +295,26 @@ if __name__ == '__main__':
                         help='torch.hub facebookresearch/dinov2 model for --mal_ev_backbone frozen_dinov2')
     parser.add_argument('--mal_dino_input', type=int, nargs=2, default=[504, 896],
                         help='H W the views are resized to before DINOv2 (multiples of 14)')
+    # Pseudo labels (--loss pseudo), PSEUDO_LABEL.md. Distances are in OUTPUT map cells
+    # (grid_reduce 4: 1 cell = 10 cm on Wildtrack / MultiviewX).
+    parser.add_argument('--pseudo_dir', type=str, default=None,
+                        help='per-frame pseudo-label json dir from tools/pseudo/build_pseudo.py or make_oracle.py')
+    parser.add_argument('--ps_variant', type=str, default='gauss', choices=PS_VARIANTS,
+                        help='gauss = Gaussian at a random point of the r-disk (B); point = one pixel at a random '
+                             'point pushed to 1 (A, r=0: basic alpha*l(P,1)); maxval = max of P in the disk pushed '
+                             'to 1 (C); mil = Gaussian at the argmax of P in the disk')
+    parser.add_argument('--ps_r', type=float, default=0.0, help='location-uncertainty radius (output cells)')
+    parser.add_argument('--ps_r_ignore', type=float, default=-1,
+                        help='background pixels within this radius of a pseudo point get weight 0; -1 = 1.5 * ps_r')
+    parser.add_argument('--ps_alpha', type=str, default='const', choices=['const', 'score', 'views'],
+                        help='confidence alpha: constant, detector score, or score * min(1, n_views / min(k, n_visible))')
+    parser.add_argument('--ps_alpha_const', type=float, default=0.5)
+    parser.add_argument('--ps_views_k', type=int, default=3)
+    parser.add_argument('--ps_min_score', type=float, default=0.0, help='drop pseudo points with a lower score')
+    parser.add_argument('--ps_min_views', type=int, default=1, help='drop pseudo points seen by fewer cameras')
+    parser.add_argument('--ps_lambda', type=float, default=1.0, help='lambda_max of the pseudo term')
+    parser.add_argument('--ps_warmup', type=int, default=0, help='epochs with lambda_ps = 0')
+    parser.add_argument('--ps_ramp', type=int, default=1, help='epochs of linear ramp to lambda_max after warm-up')
     parser.add_argument('--mal_conf_grad_q', action='store_true',
                         help='ABLATION ONLY: let L_conf backprop into q (default: q detached in L_conf, '
                              'learned only from c via L_q -- the spec forbids self-judging)')

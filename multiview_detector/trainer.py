@@ -13,6 +13,7 @@ from multiview_detector.utils.meters import AverageMeter
 from multiview_detector.utils.image_utils import add_heatmap_to_image
 from multiview_detector.loss.gaussian_mse import GaussianMSE
 from multiview_detector.loss.missing_annotation_loss import MissingAnnotationLoss
+from multiview_detector.loss.pseudo_gaussian_mse import PseudoGaussianMSE
 
 
 class BaseTrainer(object):
@@ -22,7 +23,7 @@ class BaseTrainer(object):
 
 class PerspectiveTrainer(BaseTrainer):
     def __init__(self, model, criterion, logdir, denormalize, cls_thres=0.4, alpha=1.0,
-                 mal_warmup_epochs=0, aux_optimizer=None, clip_grad_norm=0.0):
+                 mal_warmup_epochs=0, aux_optimizer=None, clip_grad_norm=0.0, ps_schedule=(1.0, 0, 1)):
         super(BaseTrainer, self).__init__()
         self.model = model
         self.criterion = criterion
@@ -38,6 +39,16 @@ class PerspectiveTrainer(BaseTrainer):
         # 0 = off (original MVDet). Applied to the main-branch parameters only, after the NaN guard.
         self.clip_grad_norm = clip_grad_norm
         self.img_criterion = GaussianMSE()  # per-view head/foot loss is always the original one
+        # pseudo-label loss: lambda_ps(epoch) = lam_max * min(1, (epoch - warmup) / ramp), 0 during warm-up
+        self.is_pseudo = isinstance(criterion, PseudoGaussianMSE)
+        self.ps_lam_max, self.ps_warmup, self.ps_ramp = ps_schedule
+
+    def lambda_ps(self, epoch):
+        """epoch is 1-based"""
+        e = epoch - 1
+        if e < self.ps_warmup:
+            return 0.0
+        return self.ps_lam_max * min(1.0, (e - self.ps_warmup + 1) / max(self.ps_ramp, 1))
 
     def _forward(self, data):
         # model returns (map_res, imgs_res) or, with the missing-annotation branches, (map_res, imgs_res, mal_out)
@@ -46,21 +57,34 @@ class PerspectiveTrainer(BaseTrainer):
         mal_out = out[2] if len(out) > 2 else None
         return map_res, imgs_res, mal_out
 
-    def _loss(self, map_res, imgs_res, mal_out, map_gt, imgs_gt, dataset, active=False):
+    def _loss(self, map_res, imgs_res, mal_out, map_gt, imgs_gt, dataset, active=False, pseudo=None):
         """Returns (total_loss, components dict or None)."""
         img_loss = 0
         for img_res, img_gt in zip(imgs_res, imgs_gt):
             img_loss += self.img_criterion(img_res, img_gt.to(img_res.device), dataset.img_kernel)
         img_loss = img_loss / len(imgs_gt) * self.alpha
+        if self.is_pseudo:
+            map_loss, st = self.criterion(map_res, map_gt.to(map_res.device), dataset.map_kernel, pseudo)
+            if st is not None:
+                st['l_view'] = img_loss.item()
+            return map_loss + img_loss, st
         if not self.is_mal:
             return self.criterion(map_res, map_gt.to(map_res.device), dataset.map_kernel) + img_loss, None
         out = self.criterion(map_res, map_gt.to(map_res.device), dataset.map_kernel, imgs_gt, dataset.img_kernel,
                              mal_out, active=active)
         return out['total'] + img_loss, out
 
-    def _write_mal_stats(self, record):
-        with open(os.path.join(self.logdir, 'mal_stats.jsonl'), 'a') as f:
+    def _write_mal_stats(self, record, fname='mal_stats.jsonl'):
+        with open(os.path.join(self.logdir, fname), 'a') as f:
             f.write(json.dumps(record) + '\n')
+
+    PS_KEYS = ('l_gt', 'l_ps', 'l_view', 'n_ps', 'p_at_ps', 'alpha_mean', 'ignored_frac')
+
+    def _ps_str(self, ps_s):
+        if not self.is_pseudo or ps_s['l_gt'].count == 0:
+            return ''
+        return (', lam_ps: {:.2f}, L_gt: {:.5f}, L_ps: {:.5f}, L_view: {:.5f}, n_ps: {:.1f}, P@ps: {:.3f}, '
+                'alpha: {:.3f}, ignored: {:.4f}'.format(self.criterion.lam, *(ps_s[k].avg for k in self.PS_KEYS)))
 
     def train(self, epoch, data_loader, optimizer, log_interval=100, cyclic_scheduler=None):
         self.model.train()
@@ -69,6 +93,11 @@ class PerspectiveTrainer(BaseTrainer):
         active = self.is_mal and epoch > self.mal_warmup_epochs
         comp_s = {k: AverageMeter() for k in ['map', 'q', 's', 's_pos', 's_neg', 'prior', 'q_bg_mean', 'c_bg_mean', 'c_mean']}
         q_hist = torch.zeros(10)
+        ps_s = {k: AverageMeter() for k in self.PS_KEYS}
+        if self.is_pseudo:
+            self.criterion.train()
+            self.criterion.lam = self.lambda_ps(epoch)
+            print(f'[pseudo] epoch {epoch}: lambda_ps = {self.criterion.lam:.3f}')
         n_skipped = 0
         if self.is_mal:
             print(f'[mal] epoch {epoch}: L_conf/L_q {"ACTIVE" if active else "OFF (warm-up, plain GaussianMSE)"}; '
@@ -77,14 +106,16 @@ class PerspectiveTrainer(BaseTrainer):
         t_b = time.time()
         t_forward = 0
         t_backward = 0
-        for batch_idx, (data, map_gt, imgs_gt, _) in enumerate(data_loader):
+        for batch_idx, batch in enumerate(data_loader):
+            data, map_gt, imgs_gt = batch[:3]
+            pseudo = batch[4] if len(batch) > 4 else None
             optimizer.zero_grad()
             if self.aux_optimizer is not None:
                 self.aux_optimizer.zero_grad()
             map_res, imgs_res, mal_out = self._forward(data)
             t_f = time.time()
             t_forward += t_f - t_b
-            loss, comp = self._loss(map_res, imgs_res, mal_out, map_gt, imgs_gt, data_loader.dataset, active)
+            loss, comp = self._loss(map_res, imgs_res, mal_out, map_gt, imgs_gt, data_loader.dataset, active, pseudo)
             loss.backward()
             # NaN guard: a single non-finite loss / gradient would poison the weights for the rest of
             # the run, so skip this step (both optimizers) and report it instead of silently stepping.
@@ -97,7 +128,7 @@ class PerspectiveTrainer(BaseTrainer):
                     print(f'[nan-guard] epoch {epoch} batch {batch_idx + 1}: loss={loss.item():.4g}, '
                           f'grad_norm={grad_norm.item():.4g}, maxima={map_res.max().item():.4g}'
                           + (f', L_map={comp["map"].item():.4g}, L_q={comp["q"].item():.4g}, '
-                             f'L_s={comp["s"].item():.4g}' if comp is not None else '')
+                             f'L_s={comp["s"].item():.4g}' if comp is not None and self.is_mal else '')
                           + ' -> step skipped')
                 optimizer.zero_grad()
                 if self.aux_optimizer is not None:
@@ -108,7 +139,11 @@ class PerspectiveTrainer(BaseTrainer):
             if self.aux_optimizer is not None:
                 self.aux_optimizer.step()
             losses += loss.item()
-            if comp is not None:
+            if comp is not None and self.is_pseudo:
+                for k in self.PS_KEYS:
+                    if k in comp and comp[k] == comp[k]:  # skip NaN (frame without pseudo points)
+                        ps_s[k].update(comp[k])
+            elif comp is not None:
                 for k in ['map', 'q', 's', 's_pos', 's_neg', 'prior']:
                     comp_s[k].update(comp[k].detach().item())
                 for k in ['q_bg_mean', 'c_bg_mean', 'c_mean']:
@@ -138,7 +173,8 @@ class PerspectiveTrainer(BaseTrainer):
                 print('Train Epoch: {}, Batch:{}, Loss: {:.6f}, '
                       'prec: {:.1f}%, recall: {:.1f}%, Time: {:.1f} (f{:.3f}+b{:.3f}), maxima: {:.3f}'.format(
                     epoch, (batch_idx + 1), losses / (batch_idx + 1), precision_s.avg * 100, recall_s.avg * 100,
-                    t_epoch, t_forward / max(batch_idx, 1), t_backward / max(batch_idx, 1), map_res.max()) + self._mal_str(comp_s))
+                    t_epoch, t_forward / max(batch_idx, 1), t_backward / max(batch_idx, 1), map_res.max())
+                      + self._mal_str(comp_s) + self._ps_str(ps_s))
                 pass
 
         t1 = time.time()
@@ -146,7 +182,7 @@ class PerspectiveTrainer(BaseTrainer):
         print('Train Epoch: {}, Batch:{}, Loss: {:.6f}, '
               'Precision: {:.1f}%, Recall: {:.1f}%, Time: {:.3f}'.format(
             epoch, len(data_loader), losses / len(data_loader), precision_s.avg * 100, recall_s.avg * 100, t_epoch)
-              + self._mal_str(comp_s))
+              + self._mal_str(comp_s) + self._ps_str(ps_s))
         if n_skipped:
             print(f'[nan-guard] epoch {epoch}: {n_skipped}/{len(data_loader)} steps skipped because of '
                   f'non-finite loss/gradients -- if this is most of the epoch the weights are already NaN')
@@ -161,6 +197,11 @@ class PerspectiveTrainer(BaseTrainer):
                 epoch, ' '.join(f'{h:.3f}' for h in hist)))
             self._write_mal_stats({'epoch': epoch, 'active': active, 'loss': losses / len(data_loader),
                                    **{k: m.avg for k, m in comp_s.items()}, 'q_hist': hist})
+
+        if self.is_pseudo:
+            self._write_mal_stats({'epoch': epoch, 'lam_ps': self.criterion.lam, 'loss': losses / len(data_loader),
+                                   'precision': precision_s.avg * 100, 'recall': recall_s.avg * 100,
+                                   **{k: m.avg for k, m in ps_s.items()}}, 'pseudo_stats.jsonl')
 
         return losses / len(data_loader), precision_s.avg * 100
 
@@ -180,7 +221,10 @@ class PerspectiveTrainer(BaseTrainer):
         t0 = time.time()
         if res_fpath is not None:
             assert gt_fpath is not None
-        for batch_idx, (data, map_gt, imgs_gt, frame) in enumerate(data_loader):
+        if self.is_pseudo:
+            self.criterion.eval()  # no jitter
+        for batch_idx, batch in enumerate(data_loader):
+            data, map_gt, imgs_gt, frame = batch[:4]
             with torch.no_grad():
                 map_res, imgs_res, mal_out = self._forward(data)
             if res_fpath is not None:

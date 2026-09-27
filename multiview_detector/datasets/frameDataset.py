@@ -11,7 +11,8 @@ from multiview_detector.utils.projection import *
 
 class frameDataset(VisionDataset):
     def __init__(self, base, train=True, transform=ToTensor(), target_transform=ToTensor(),
-                 reID=False, grid_reduce=4, img_reduce=4, train_ratio=0.9, force_download=True):
+                 reID=False, grid_reduce=4, img_reduce=4, train_ratio=0.9, force_download=True,
+                 pseudo_dir=None, pseudo_cfg=None):
         super().__init__(base.root, transform=transform, target_transform=target_transform)
 
         map_sigma, map_kernel_size = 20 / grid_reduce, 20
@@ -36,6 +37,12 @@ class frameDataset(VisionDataset):
         self.gt_fpath = self._get_gt_fpath()
         if not os.path.exists(self.gt_fpath) or force_download:
             self.prepare_gt()
+
+        # pseudo labels (train split only, see PSEUDO_LABEL.md): frame -> (N, 3) [row, col, alpha] on the output map
+        self.pseudo = None
+        if pseudo_dir is not None:
+            assert train, 'pseudo labels are only ever used on the train split'
+            self.load_pseudo(pseudo_dir, pseudo_cfg or {})
 
         x, y = np.meshgrid(np.arange(-map_kernel_size, map_kernel_size + 1),
                            np.arange(-map_kernel_size, map_kernel_size + 1))
@@ -144,6 +151,49 @@ class frameDataset(VisionDataset):
                                              shape=self.img_shape)
                     self.imgs_head_foot_gt[frame][cam] = [img_gt_head, img_gt_foot]
 
+    def load_pseudo(self, pseudo_dir, cfg):
+        """<pseudo_dir>/<frame:08d>.json from tools/pseudo (grid = full-res [gx, gy], same convention as the
+        annotations). cfg: alpha ('const' | 'score' | 'views'), alpha_const, views_k, min_score, min_views."""
+        mode, a_const = cfg.get('alpha', 'const'), cfg.get('alpha_const', 0.5)
+        views_k, min_score, min_views = cfg.get('views_k', 3), cfg.get('min_score', 0.0), cfg.get('min_views', 1)
+        self.pseudo, missing, n_raw, alphas = {}, 0, 0, []
+        for frame in self.map_gt:
+            fpath = os.path.join(pseudo_dir, f'{frame:08d}.json')
+            if not os.path.isfile(fpath):
+                missing += 1
+                self.pseudo[frame] = np.zeros([0, 3], np.float32)
+                continue
+            with open(fpath) as f:
+                pts = json.load(f)
+            n_raw += len(pts)
+            rows = []
+            for p in pts:
+                if p['score'] < min_score or p['n_views'] < min_views:
+                    continue
+                if mode == 'const':
+                    alpha = a_const
+                elif mode == 'score':
+                    alpha = p['score']
+                elif mode == 'views':
+                    # agreement relative to how many cameras can see that spot at all
+                    alpha = p['score'] * min(1.0, p['n_views'] / max(1, min(views_k, p.get('n_visible', views_k))))
+                else:
+                    raise ValueError(mode)
+                gx, gy = p['grid']
+                # same index convention as download(): row/col on the reduced map (float, floored in the loss)
+                if self.base.indexing == 'xy':
+                    rows.append([gy / self.grid_reduce, gx / self.grid_reduce, alpha])
+                else:
+                    rows.append([gx / self.grid_reduce, gy / self.grid_reduce, alpha])
+                alphas.append(alpha)
+            self.pseudo[frame] = np.array(rows, np.float32).reshape(-1, 3)
+        if missing == len(self.map_gt):
+            raise FileNotFoundError(f'no pseudo-label file for any train frame in {pseudo_dir}')
+        n = sum(len(v) for v in self.pseudo.values())
+        print(f'[pseudo] {pseudo_dir}: {n}/{n_raw} points kept (min_score {min_score}, min_views {min_views}) '
+              f'over {len(self.pseudo)} train frames ({n / max(len(self.pseudo), 1):.1f}/frame), '
+              f'alpha={mode} mean {np.mean(alphas) if alphas else 0:.3f}, frames without file: {missing}')
+
     def __getitem__(self, index):
         frame = list(self.map_gt.keys())[index]
         imgs = []
@@ -169,6 +219,8 @@ class frameDataset(VisionDataset):
             if self.target_transform is not None:
                 img_gt = self.target_transform(img_gt)
             imgs_gt.append(img_gt.float())
+        if self.pseudo is not None:
+            return imgs, map_gt.float(), imgs_gt, frame, torch.from_numpy(self.pseudo[frame])
         return imgs, map_gt.float(), imgs_gt, frame
 
     def __len__(self):
