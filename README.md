@@ -1,6 +1,3 @@
-> **Branch `pseudo-label` (Nhutan410/MVDet-PS):** code gốc + pseudo label cho huấn luyện thiếu nhãn
-> (`--loss pseudo`, `tools/pseudo/`). Toàn bộ quá trình, cách chạy và số liệu: [PSEUDO_LABEL_REPORT.md](PSEUDO_LABEL_REPORT.md).
-
 # Multiview Detection with Feature Perspective Transformation [[Website](https://hou-yz.github.io/publication/2020-eccv2020-mvdet)] [[arXiv](https://arxiv.org/abs/2007.07247)]
 
 ```

@@ -3,7 +3,7 @@ CPU unit tests for the pseudo-label loss (no dataset, no GPU needed):
 
     python -m pytest tests/test_pseudo_loss.py -q      # or:  python tests/test_pseudo_loss.py
 
-They pin down the design of PSEUDO_LABEL_REPORT.md:
+They pin down the design of the pseudo-label loss:
   * without pseudo points the loss is exactly GaussianMSE,
   * gauss, r = 0, alpha * lambda = 1, no ignore == GaussianMSE with the pseudo points added to map_gt,
   * one pseudo person weighs as much as one kept person at P = 0 (every variant),

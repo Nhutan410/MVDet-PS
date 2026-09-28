@@ -111,7 +111,7 @@ def main(args):
     # loss
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     if args.loss == 'pseudo':
-        # kept labels as in GaussianMSE + pseudo labels from a 2D detector -- see PSEUDO_LABEL_REPORT.md
+        # kept labels as in GaussianMSE + pseudo labels from a 2D detector
         criterion = PseudoGaussianMSE(variant=args.ps_variant, r=args.ps_r, r_ignore=ps_r_ignore(args),
                                       r_ignore_only=args.ps_ignore_r).to(device)
         loss_tag = pseudo_tag(args)
@@ -199,7 +199,7 @@ if __name__ == '__main__':
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument('--seed', type=int, default=1, help='random seed (default: None)')
 
-    # Pseudo labels (--loss pseudo), see PSEUDO_LABEL_REPORT.md. Distances are in OUTPUT map cells
+    # Pseudo labels (--loss pseudo). Distances are in OUTPUT map cells
     # (grid_reduce 4: 1 cell = 10 cm on Wildtrack / MultiviewX).
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'pseudo'],
                         help='mse = original GaussianMSE; pseudo = GaussianMSE on the kept labels + pseudo labels')

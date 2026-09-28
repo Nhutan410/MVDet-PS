@@ -41,7 +41,7 @@ class frameDataset(VisionDataset):
         if not os.path.exists(self.gt_fpath) or force_download:
             self.prepare_gt()
 
-        # pseudo labels (train split only, see PSEUDO_LABEL_REPORT.md): frame -> (N, 3) [row, col, alpha] on the
+        # pseudo labels (train split only): frame -> (N, 3) [row, col, alpha] on the
         # output map; alpha < 0 marks an ignore-only point
         self.pseudo = None
         if pseudo_dir is not None:

@@ -23,7 +23,7 @@ def sample_in_disk(n, r, device):
 
 class PseudoGaussianMSE(nn.Module):
     """
-    GaussianMSE + pseudo-labelled people (off-the-shelf 2D detector -> ground plane), see PSEUDO_LABEL_REPORT.md.
+    GaussianMSE + pseudo-labelled people (off-the-shelf 2D detector -> ground plane).
 
     Kept (real) labels are handled exactly like GaussianMSE. Each pseudo point k (map row/col, confidence
     alpha_k) is uncertain in LOCATION, not in value, so it gets a positive target near -- not exactly at --

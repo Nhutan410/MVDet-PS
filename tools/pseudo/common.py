@@ -1,5 +1,5 @@
 """
-Shared helpers of the pseudo-label pipeline (see PSEUDO_LABEL_REPORT.md).
+Shared helpers of the pseudo-label pipeline.
 
 Coordinate conventions -- everything reuses the dataset classes, nothing is re-derived:
   * "grid" = the dataset's full-resolution world grid [gx, gy], exactly what
