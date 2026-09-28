@@ -68,6 +68,8 @@ def main(args):
     for frame in frames:
         with open(pseudo_fname(args.pseudo, frame)) as f:
             pseudo = json.load(f)
+        if args.tiers:
+            pseudo = [p for p in pseudo if p.get('tier', 'pos') in args.tiers]
         hidden = np.array([ped_grid(base, p) for p in hidden_people(base, args.full_ann, args.kept_ann, frame)])
         hidden = hidden.reshape(-1, 2)
         g = np.array([p['grid'] for p in pseudo]).reshape(-1, 2)
@@ -107,7 +109,8 @@ def main(args):
            'precision_by_n_views@0.5m': {('4+' if k == 4 else str(k)): {'precision': v[0] / v[1], 'n': v[1]}
                                          for k, v in sorted(by_views.items())},
            'precision_by_score@0.5m': {k: {'precision': v[0] / v[1], 'n': v[1]} for k, v in sorted(by_score.items())}}
-    with open(os.path.join(args.pseudo, 'eval.json'), 'w') as f:
+    out_name = 'eval.json' if not args.tiers else f'eval_{"_".join(args.tiers)}.json'
+    with open(os.path.join(args.pseudo, out_name), 'w') as f:
         json.dump(rep, f, indent=2)
     print(json.dumps(rep, indent=2))
 
@@ -121,4 +124,6 @@ if __name__ == '__main__':
     p.add_argument('--pseudo', required=True)
     p.add_argument('--viz_dir', default=None)
     p.add_argument('--viz_n', type=int, default=4)
+    p.add_argument('--tiers', nargs='*', default=None,
+                   help='only evaluate points whose "tier" field is in this list (teacher_rescore output)')
     main(p.parse_args())
