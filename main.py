@@ -4,7 +4,6 @@ os.environ['OMP_NUM_THREADS'] = '1'
 import argparse
 import sys
 import shutil
-from distutils.dir_util import copy_tree
 import datetime
 import tqdm
 import numpy as np
@@ -13,6 +12,7 @@ import torch.optim as optim
 import torchvision.transforms as T
 from multiview_detector.datasets import *
 from multiview_detector.loss.gaussian_mse import GaussianMSE
+from multiview_detector.loss.pseudo_gaussian_mse import PseudoGaussianMSE, VARIANTS as PS_VARIANTS
 from multiview_detector.models.persp_trans_detector import PerspTransDetector
 from multiview_detector.models.image_proj_variant import ImageProjVariant
 from multiview_detector.models.res_proj_variant import ResProjVariant
@@ -21,6 +21,36 @@ from multiview_detector.utils.logger import Logger
 from multiview_detector.utils.draw_curve import draw_curve
 from multiview_detector.utils.image_utils import img_color_denormalize
 from multiview_detector.trainer import PerspectiveTrainer
+
+
+def ps_r_ignore(args):
+    return 1.5 * args.ps_r if args.ps_r_ignore < 0 else args.ps_r_ignore
+
+
+def pseudo_cfg(args):
+    return {'alpha': args.ps_alpha, 'alpha_const': args.ps_alpha_const, 'views_k': args.ps_views_k,
+            'min_score': args.ps_min_score, 'min_views': args.ps_min_views,
+            'min_view_ratio': args.ps_min_view_ratio, 'ignore_min_views': args.ps_ignore_min_views,
+            'border': args.ps_border * 4}  # output cells -> full-res grid cells (grid_reduce 4)
+
+
+def pseudo_tag(args):
+    """log sub-directory name, one per pseudo-label configuration"""
+    tag = f'pseudo_{args.ps_variant}_r{args.ps_r:g}_ri{ps_r_ignore(args):g}_a{args.ps_alpha}'
+    if args.ps_alpha == 'const':
+        tag += f'{args.ps_alpha_const:g}'
+    tag += f'_l{args.ps_lambda:g}_w{args.ps_warmup}r{args.ps_ramp}'
+    if args.ps_min_score > 0:
+        tag += f'_ms{args.ps_min_score:g}'
+    if args.ps_min_views > 1:
+        tag += f'_mv{args.ps_min_views}'
+    if args.ps_min_view_ratio > 0:
+        tag += f'_vr{args.ps_min_view_ratio:g}'
+    if args.ps_ignore_min_views > 0:
+        tag += f'_ig{args.ps_ignore_min_views}r{args.ps_ignore_r:g}'
+    if args.ps_border > 0:
+        tag += f'_b{args.ps_border:g}'
+    return tag + '_' + os.path.basename(os.path.normpath(args.pseudo_dir))
 
 
 def main(args):
@@ -46,7 +76,15 @@ def main(args):
         base = MultiviewX(data_path)
     else:
         raise Exception('must choose from [wildtrack, multiviewx]')
-    train_set = frameDataset(base, train=True, transform=train_trans, grid_reduce=4)
+    if args.loss == 'pseudo':
+        if args.pseudo_dir is None:
+            raise Exception('--loss pseudo needs --pseudo_dir (tools/pseudo/build_pseudo.py output)')
+        if args.batch_size != 1:
+            raise Exception('--loss pseudo: pseudo points differ in number per frame, use --batch_size 1')
+        train_set = frameDataset(base, train=True, transform=train_trans, grid_reduce=4,
+                                 pseudo_dir=os.path.expanduser(args.pseudo_dir), pseudo_cfg=pseudo_cfg(args))
+    else:
+        train_set = frameDataset(base, train=True, transform=train_trans, grid_reduce=4)
     test_set = frameDataset(base, train=False, transform=train_trans, grid_reduce=4)
 
     train_loader = torch.utils.data.DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
@@ -71,14 +109,23 @@ def main(args):
                                                     epochs=args.epochs)
 
     # loss
-    criterion = GaussianMSE().cuda()
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if args.loss == 'pseudo':
+        # kept labels as in GaussianMSE + pseudo labels from a 2D detector -- see PSEUDO_LABEL_REPORT.md
+        criterion = PseudoGaussianMSE(variant=args.ps_variant, r=args.ps_r, r_ignore=ps_r_ignore(args),
+                                      r_ignore_only=args.ps_ignore_r).to(device)
+        loss_tag = pseudo_tag(args)
+    else:
+        criterion = GaussianMSE().to(device)
+        loss_tag = 'mse'
 
     # logging
-    logdir = f'logs/{args.dataset}_frame/{args.variant}/' + datetime.datetime.today().strftime('%Y-%m-%d_%H-%M-%S') \
-        if not args.resume else f'logs/{args.dataset}_frame/{args.variant}/{args.resume}'
+    logdir = f'logs/{args.dataset}_frame/{loss_tag}/{args.variant}/' + \
+        datetime.datetime.today().strftime('%Y-%m-%d_%H-%M-%S') \
+        if not args.resume else f'logs/{args.dataset}_frame/{loss_tag}/{args.variant}/{args.resume}'
     if args.resume is None:
         os.makedirs(logdir, exist_ok=True)
-        copy_tree('./multiview_detector', logdir + '/scripts/multiview_detector')
+        shutil.copytree('./multiview_detector', logdir + '/scripts/multiview_detector', dirs_exist_ok=True)
         for script in os.listdir('.'):
             if script.split('.')[-1] == 'py':
                 dst_file = os.path.join(logdir, 'scripts', os.path.basename(script))
@@ -95,7 +142,8 @@ def main(args):
     test_prec_s = []
     test_moda_s = []
 
-    trainer = PerspectiveTrainer(model, criterion, logdir, denormalize, args.cls_thres, args.alpha)
+    trainer = PerspectiveTrainer(model, criterion, logdir, denormalize, args.cls_thres, args.alpha,
+                                 ps_schedule=(args.ps_lambda, args.ps_warmup, args.ps_ramp))
 
     # learn
     if args.resume is None:
@@ -120,7 +168,7 @@ def main(args):
             # save
             torch.save(model.state_dict(), os.path.join(logdir, 'MultiviewDetector.pth'))
     else:
-        resume_dir = f'logs/{args.dataset}_frame/{args.variant}/' + args.resume
+        resume_dir = f'logs/{args.dataset}_frame/{loss_tag}/{args.variant}/' + args.resume
         resume_fname = resume_dir + '/MultiviewDetector.pth'
         model.load_state_dict(torch.load(resume_fname))
         model.eval()
@@ -150,6 +198,39 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--visualize', action='store_true')
     parser.add_argument('--seed', type=int, default=1, help='random seed (default: None)')
+
+    # Pseudo labels (--loss pseudo), see PSEUDO_LABEL_REPORT.md. Distances are in OUTPUT map cells
+    # (grid_reduce 4: 1 cell = 10 cm on Wildtrack / MultiviewX).
+    parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'pseudo'],
+                        help='mse = original GaussianMSE; pseudo = GaussianMSE on the kept labels + pseudo labels')
+    parser.add_argument('--pseudo_dir', type=str, default=None,
+                        help='per-frame pseudo-label json dir from tools/pseudo/build_pseudo.py or make_oracle.py')
+    parser.add_argument('--ps_variant', type=str, default='gauss', choices=PS_VARIANTS,
+                        help='gauss = Gaussian at a random point of the r-disk (B); point = one pixel at a random '
+                             'point pushed to 1 (A, r=0: basic alpha*l(P,1)); maxval = max of P in the disk pushed '
+                             'to 1 (C); mil = Gaussian at the argmax of P in the disk')
+    parser.add_argument('--ps_r', type=float, default=0.0, help='location-uncertainty radius (output cells)')
+    parser.add_argument('--ps_r_ignore', type=float, default=-1,
+                        help='background pixels within this radius of a pseudo point get weight 0; -1 = 1.5 * ps_r')
+    parser.add_argument('--ps_alpha', type=str, default='const', choices=['const', 'score', 'views'],
+                        help='confidence alpha: constant, detector score, or score * min(1, n_views / min(k, n_visible))')
+    parser.add_argument('--ps_alpha_const', type=float, default=0.5)
+    parser.add_argument('--ps_views_k', type=int, default=3)
+    parser.add_argument('--ps_min_score', type=float, default=0.0, help='positive only if score >= this')
+    parser.add_argument('--ps_min_views', type=int, default=1, help='positive only if seen by >= this many cameras')
+    parser.add_argument('--ps_min_view_ratio', type=float, default=0.0,
+                        help='positive only if n_views / n_visible >= this (cameras that detect it / that can see it)')
+    parser.add_argument('--ps_ignore_min_views', type=int, default=0,
+                        help='3-tier pseudo: points failing the positive filters but with n_views >= this become '
+                             'IGNORE regions (neither positive nor background); 0 = off (they are background)')
+    parser.add_argument('--ps_ignore_r', type=float, default=10.0,
+                        help='radius (output cells) of the weight-0 disk around an ignore-only point')
+    parser.add_argument('--ps_border', type=float, default=0.0,
+                        help='drop pseudo points closer than this (output cells, 10 = 1 m) to the edge of the '
+                             'annotated area -- they stay background (most projection ghosts are there)')
+    parser.add_argument('--ps_lambda', type=float, default=1.0, help='lambda_max of the pseudo term')
+    parser.add_argument('--ps_warmup', type=int, default=0, help='epochs with lambda_ps = 0')
+    parser.add_argument('--ps_ramp', type=int, default=1, help='epochs of linear ramp to lambda_max after warm-up')
     args = parser.parse_args()
 
     main(args)

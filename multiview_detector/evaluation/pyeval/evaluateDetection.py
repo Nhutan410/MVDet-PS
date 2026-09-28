@@ -51,6 +51,15 @@ def evaluateDetection_py(res_fpath, gt_fpath, dataset_name):
 
     gtRaw = np.loadtxt(gt_fpath)
     detRaw = np.loadtxt(res_fpath)
+    # np.loadtxt collapses a file with exactly 1 data row into a 1-D array (shape (ncols,)
+    # instead of (1, ncols)) -- happens routinely at a strict cls_thres under partial-annotation
+    # checkpoints, where only a handful of detections survive across the whole test set. Restore
+    # the row axis so the `[:, 0]`/`[idx, 1]` indexing below keeps working; skip when truly empty
+    # (shape (0,)).
+    if gtRaw.ndim == 1 and gtRaw.size:
+        gtRaw = gtRaw.reshape(1, -1)
+    if detRaw.ndim == 1 and detRaw.size:
+        detRaw = detRaw.reshape(1, -1)
     frames = np.unique(detRaw[:, 0]) if detRaw.size else np.zeros(0)
     frame_ctr = 0
     gt_flag = True

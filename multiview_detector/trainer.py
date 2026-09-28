@@ -1,4 +1,5 @@
 import time
+import json
 import torch
 import os
 import numpy as np
@@ -10,6 +11,8 @@ from multiview_detector.evaluation.evaluate import evaluate
 from multiview_detector.utils.nms import nms
 from multiview_detector.utils.meters import AverageMeter
 from multiview_detector.utils.image_utils import add_heatmap_to_image
+from multiview_detector.loss.gaussian_mse import GaussianMSE
+from multiview_detector.loss.pseudo_gaussian_mse import PseudoGaussianMSE
 
 
 class BaseTrainer(object):
@@ -18,7 +21,9 @@ class BaseTrainer(object):
 
 
 class PerspectiveTrainer(BaseTrainer):
-    def __init__(self, model, criterion, logdir, denormalize, cls_thres=0.4, alpha=1.0):
+    PS_KEYS = ('l_gt', 'l_ps', 'l_view', 'n_ps', 'n_ign', 'p_at_ps', 'alpha_mean', 'ignored_frac')
+
+    def __init__(self, model, criterion, logdir, denormalize, cls_thres=0.4, alpha=1.0, ps_schedule=(1.0, 0, 1)):
         super(BaseTrainer, self).__init__()
         self.model = model
         self.criterion = criterion
@@ -26,28 +31,67 @@ class PerspectiveTrainer(BaseTrainer):
         self.logdir = logdir
         self.denormalize = denormalize
         self.alpha = alpha
+        # pseudo labels: the BEV map loss is PseudoGaussianMSE, the per-view head/foot loss stays GaussianMSE;
+        # lambda_ps(epoch) = lam_max * min(1, (epoch - warmup) / ramp), 0 during the warm-up
+        self.is_pseudo = isinstance(criterion, PseudoGaussianMSE)
+        self.img_criterion = GaussianMSE() if self.is_pseudo else criterion
+        self.ps_lam_max, self.ps_warmup, self.ps_ramp = ps_schedule
+
+    def lambda_ps(self, epoch):
+        """epoch is 1-based"""
+        e = epoch - 1
+        if e < self.ps_warmup:
+            return 0.0
+        return self.ps_lam_max * min(1.0, (e - self.ps_warmup + 1) / max(self.ps_ramp, 1))
+
+    def _loss(self, map_res, imgs_res, map_gt, imgs_gt, dataset, pseudo=None):
+        """original MVDet loss; with pseudo labels also returns the per-term stats (else None)"""
+        img_loss = 0
+        for img_res, img_gt in zip(imgs_res, imgs_gt):
+            img_loss += self.img_criterion(img_res, img_gt.to(img_res.device), dataset.img_kernel)
+        img_loss = img_loss / len(imgs_gt) * self.alpha
+        if not self.is_pseudo:
+            return self.criterion(map_res, map_gt.to(map_res.device), dataset.map_kernel) + img_loss, None
+        map_loss, st = self.criterion(map_res, map_gt.to(map_res.device), dataset.map_kernel, pseudo)
+        if st is not None:
+            st['l_view'] = img_loss.item()
+        return map_loss + img_loss, st
+
+    def _ps_str(self, ps_s):
+        if not self.is_pseudo or ps_s['l_gt'].count == 0:
+            return ''
+        return (', lam_ps: {:.2f}, L_gt: {:.5f}, L_ps: {:.5f}, L_view: {:.5f}, n_ps: {:.1f}, n_ign: {:.1f}, '
+                'P@ps: {:.3f}, alpha: {:.3f}, ignored: {:.4f}'.format(self.criterion.lam,
+                                                                      *(ps_s[k].avg for k in self.PS_KEYS)))
 
     def train(self, epoch, data_loader, optimizer, log_interval=100, cyclic_scheduler=None):
         self.model.train()
         losses = 0
         precision_s, recall_s = AverageMeter(), AverageMeter()
+        ps_s = {k: AverageMeter() for k in self.PS_KEYS}
+        if self.is_pseudo:
+            self.criterion.train()  # jitter on
+            self.criterion.lam = self.lambda_ps(epoch)
+            print(f'[pseudo] epoch {epoch}: lambda_ps = {self.criterion.lam:.3f}')
         t0 = time.time()
         t_b = time.time()
         t_forward = 0
         t_backward = 0
-        for batch_idx, (data, map_gt, imgs_gt, _) in enumerate(data_loader):
+        for batch_idx, batch in enumerate(data_loader):
+            data, map_gt, imgs_gt = batch[:3]
+            pseudo = batch[4] if len(batch) > 4 else None
             optimizer.zero_grad()
             map_res, imgs_res = self.model(data)
             t_f = time.time()
             t_forward += t_f - t_b
-            loss = 0
-            for img_res, img_gt in zip(imgs_res, imgs_gt):
-                loss += self.criterion(img_res, img_gt.to(img_res.device), data_loader.dataset.img_kernel)
-            loss = self.criterion(map_res, map_gt.to(map_res.device), data_loader.dataset.map_kernel) + \
-                   loss / len(imgs_gt) * self.alpha
+            loss, st = self._loss(map_res, imgs_res, map_gt, imgs_gt, data_loader.dataset, pseudo)
             loss.backward()
             optimizer.step()
             losses += loss.item()
+            if st is not None:
+                for k in self.PS_KEYS:
+                    if k in st and st[k] == st[k]:  # skip NaN (frame without pseudo points)
+                        ps_s[k].update(st[k])
             pred = (map_res > self.cls_thres).int().to(map_gt.device)
             true_positive = (pred.eq(map_gt) * pred.eq(1)).sum().item()
             false_positive = pred.sum().item() - true_positive
@@ -72,14 +116,20 @@ class PerspectiveTrainer(BaseTrainer):
                 print('Train Epoch: {}, Batch:{}, Loss: {:.6f}, '
                       'prec: {:.1f}%, recall: {:.1f}%, Time: {:.1f} (f{:.3f}+b{:.3f}), maxima: {:.3f}'.format(
                     epoch, (batch_idx + 1), losses / (batch_idx + 1), precision_s.avg * 100, recall_s.avg * 100,
-                    t_epoch, t_forward / batch_idx, t_backward / batch_idx, map_res.max()))
+                    t_epoch, t_forward / batch_idx, t_backward / batch_idx, map_res.max()) + self._ps_str(ps_s))
                 pass
 
         t1 = time.time()
         t_epoch = t1 - t0
         print('Train Epoch: {}, Batch:{}, Loss: {:.6f}, '
               'Precision: {:.1f}%, Recall: {:.1f}%, Time: {:.3f}'.format(
-            epoch, len(data_loader), losses / len(data_loader), precision_s.avg * 100, recall_s.avg * 100, t_epoch))
+            epoch, len(data_loader), losses / len(data_loader), precision_s.avg * 100, recall_s.avg * 100, t_epoch)
+              + self._ps_str(ps_s))
+        if self.is_pseudo:
+            with open(os.path.join(self.logdir, 'pseudo_stats.jsonl'), 'a') as f:
+                f.write(json.dumps({'epoch': epoch, 'lam_ps': self.criterion.lam, 'loss': losses / len(data_loader),
+                                    'precision': precision_s.avg * 100, 'recall': recall_s.avg * 100,
+                                    **{k: m.avg for k, m in ps_s.items()}}) + '\n')
 
         return losses / len(data_loader), precision_s.avg * 100
 
@@ -91,7 +141,10 @@ class PerspectiveTrainer(BaseTrainer):
         t0 = time.time()
         if res_fpath is not None:
             assert gt_fpath is not None
-        for batch_idx, (data, map_gt, imgs_gt, frame) in enumerate(data_loader):
+        if self.is_pseudo:
+            self.criterion.eval()  # no jitter
+        for batch_idx, batch in enumerate(data_loader):
+            data, map_gt, imgs_gt, frame = batch[:4]
             with torch.no_grad():
                 map_res, imgs_res = self.model(data)
             if res_fpath is not None:
@@ -105,11 +158,8 @@ class PerspectiveTrainer(BaseTrainer):
                 all_res_list.append(torch.cat([torch.ones_like(v_s) * frame, grid_xy.float() *
                                                data_loader.dataset.grid_reduce, v_s], dim=1))
 
-            loss = 0
-            for img_res, img_gt in zip(imgs_res, imgs_gt):
-                loss += self.criterion(img_res, img_gt.to(img_res.device), data_loader.dataset.img_kernel)
-            loss = self.criterion(map_res, map_gt.to(map_res.device), data_loader.dataset.map_kernel) + \
-                   loss / len(imgs_gt) * self.alpha
+            with torch.no_grad():
+                loss, _ = self._loss(map_res, imgs_res, map_gt, imgs_gt, data_loader.dataset)
             losses += loss.item()
             pred = (map_res > self.cls_thres).int().to(map_gt.device)
             true_positive = (pred.eq(map_gt) * pred.eq(1)).sum().item()
