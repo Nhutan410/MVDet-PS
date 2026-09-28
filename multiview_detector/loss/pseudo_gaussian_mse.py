@@ -47,12 +47,17 @@ class PseudoGaussianMSE(nn.Module):
     Background around pseudo points: pixels within r_ignore of a pseudo point that are not on a kept label get
     weight 0 (someone is probably there, do not push them to 0); the pseudo target pixels themselves are
     never counted as background. self.lam (set per epoch by the trainer) scales only the pseudo term.
+
+    Ignore-only points (alpha < 0 rows, the uncertain tier): no positive target at all, only a weight-0 disk of
+    radius r_ignore_only (default: the Gaussian support + location error) -- the model is neither taught that a
+    person is there nor punished for predicting one.
     """
 
-    def __init__(self, variant='gauss', r=0.0, r_ignore=0.0, bg_eps=1e-2):
+    def __init__(self, variant='gauss', r=0.0, r_ignore=0.0, bg_eps=1e-2, r_ignore_only=10.0):
         super().__init__()
         assert variant in VARIANTS, variant
         self.variant, self.r, self.r_ignore, self.bg_eps = variant, float(r), float(r_ignore), bg_eps
+        self.r_ignore_only = float(r_ignore_only)
         self.lam = 1.0
 
     def _traget_transform(self, x, target, kernel):
@@ -70,6 +75,10 @@ class PseudoGaussianMSE(nn.Module):
         vals = P[idx_c[..., 0], idx_c[..., 1]].masked_fill(~valid, float('-inf'))
         return vals, idx_c, valid
 
+    @staticmethod
+    def _anchor(pos, H, W):
+        return torch.stack([pos[:, 0].floor().long().clamp(0, H - 1), pos[:, 1].floor().long().clamp(0, W - 1)], -1)
+
     def _centres(self, P, pos, anchor):
         H, W = P.shape
         if self.variant in ('gauss', 'point'):
@@ -84,7 +93,7 @@ class PseudoGaussianMSE(nn.Module):
 
     def forward(self, x, target, kernel, pseudo=None):
         """x, target: (B, 1, H, W); pseudo: (B, N, 3) [row, col, alpha] on the output map (alpha = 0 rows are
-        padding) or None. Returns (loss, stats dict or None)."""
+        padding, alpha < 0 rows are ignore-only) or None. Returns (loss, stats dict or None)."""
         soft_gt = self._traget_transform(x, target, kernel)
         if pseudo is None:
             return F.mse_loss(x, soft_gt), None
@@ -93,26 +102,33 @@ class PseudoGaussianMSE(nn.Module):
         pad = int((kernel.shape[-1] - 1) / 2)
         kernel_mass = (kernel ** 2).sum()
         total = x.new_zeros(())
-        st = {'l_gt': 0., 'l_ps': 0., 'n_ps': 0., 'p_at_ps': 0., 'alpha_mean': 0., 'ignored_frac': 0.}
-        n_with_ps = 0
+        st = {'l_gt': 0., 'l_ps': 0., 'n_ps': 0., 'n_ign': 0., 'p_at_ps': 0., 'alpha_mean': 0., 'ignored_frac': 0.}
+        n_with_ps, n_frac = 0, 0
         for b in range(B):
             P, S = x[b, 0], soft_gt[b, 0]
-            pts = pseudo[b].to(x.device).float().reshape(-1, 3)
-            pts = pts[pts[:, 2] > 0]
+            rows = pseudo[b].to(x.device).float().reshape(-1, 3)
+            pts, ign_pts = rows[rows[:, 2] > 0], rows[rows[:, 2] < 0]
             gt_region = S > self.bg_eps
             w = torch.ones_like(S)
+            ign = torch.zeros_like(gt_region)
+            if len(ign_pts) and self.r_ignore_only > 0:
+                _, idx, valid = self._gather(S, self._anchor(ign_pts[:, :2], H, W), disk_offsets(self.r_ignore_only, x.device))
+                ign[idx[..., 0][valid], idx[..., 1][valid]] = True
+                st['n_ign'] += len(ign_pts)
+            pos, alpha = pts[:, :2], pts[:, 2]
+            anchor = self._anchor(pos, H, W)
+            if len(pts) and self.r_ignore > 0:
+                _, idx, valid = self._gather(S, anchor, disk_offsets(self.r_ignore, x.device))
+                ign[idx[..., 0][valid], idx[..., 1][valid]] = True
+            w = w.masked_fill(ign & ~gt_region, 0.)
             if len(pts) == 0:
-                l_gt = ((P - S) ** 2).sum() / (H * W)
+                l_gt = (w * (P - S) ** 2).sum() / (H * W)
                 total = total + l_gt
                 st['l_gt'] += l_gt.item()
+                if len(ign_pts):
+                    st['ignored_frac'] += (w == 0).float().mean().item()
+                    n_frac += 1
                 continue
-            pos, alpha = pts[:, :2], pts[:, 2]
-            anchor = torch.stack([pos[:, 0].floor().long().clamp(0, H - 1), pos[:, 1].floor().long().clamp(0, W - 1)], -1)
-            if self.r_ignore > 0:
-                _, idx, valid = self._gather(S, anchor, disk_offsets(self.r_ignore, x.device))
-                ign = torch.zeros_like(gt_region)
-                ign[idx[..., 0][valid], idx[..., 1][valid]] = True
-                w = w.masked_fill(ign & ~gt_region, 0.)
             c = self._centres(P, pos, anchor)
 
             if self.variant in ('gauss', 'mil'):
@@ -136,9 +152,11 @@ class PseudoGaussianMSE(nn.Module):
             st['p_at_ps'] += P.detach()[c[:, 0], c[:, 1]].mean().item()
             st['alpha_mean'] += alpha.mean().item()
             st['ignored_frac'] += (w == 0).float().mean().item()
-        for k in ('l_gt', 'l_ps', 'n_ps'):
+            n_frac += 1
+        for k in ('l_gt', 'l_ps', 'n_ps', 'n_ign'):
             st[k] /= B
-        for k in ('p_at_ps', 'alpha_mean', 'ignored_frac'):
+        for k in ('p_at_ps', 'alpha_mean'):
             st[k] = st[k] / n_with_ps if n_with_ps else float('nan')
+        st['ignored_frac'] = st['ignored_frac'] / n_frac if n_frac else float('nan')
         st['lam'] = self.lam
         return total / B, st

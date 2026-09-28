@@ -10,7 +10,8 @@ They pin down the design of PSEUDO_LABEL.md:
   * jitter only in train mode and always inside the r-disk,
   * maxval / mil follow the argmax of P inside the disk, point / maxval touch a single pixel,
   * ignore disk: no gradient on background near a pseudo point, kept labels untouched,
-  * lambda = 0 removes every pseudo gradient.
+  * lambda = 0 removes every pseudo gradient,
+  * ignore-only points (alpha < 0): weight-0 disk, no positive target.
 """
 import os
 import sys
@@ -159,6 +160,32 @@ def test_point_touches_single_pixel():
     _, st = crit(x, empty, KERNEL, pseudo_tensor([[15.0, 20.0, 1.0]]))
     expected = KERNEL.pow(2).sum() * (x[0, 0, 15, 20] - 1) ** 2 / (H * W)
     assert abs(st['l_ps'] - expected.item()) < 1e-7
+
+
+def test_ignore_only_points():
+    x = torch.rand(1, 1, H, W, requires_grad=True)
+    gt = gt_map([(15, 23)])
+    ps = pseudo_tensor([[15.0, 10.0, -1.0], [5.0, 30.0, 1.0]])  # one ignore-only, one positive
+    for variant in ('gauss', 'point', 'maxval', 'mil'):
+        crit = PseudoGaussianMSE(variant, r=0, r_ignore=0, r_ignore_only=4)
+        loss, st = crit(x, gt, KERNEL, ps)
+        g, = torch.autograd.grad(loss, x)
+        assert g[0, 0, 15, 10] == 0 and g[0, 0, 13, 12] == 0, variant  # ignore disk: no push up, no push down
+        assert g[0, 0, 15, 23] != 0, variant  # kept label next to it untouched
+        assert g[0, 0, 5, 30] < 0 or variant in ('gauss', 'mil'), variant  # positive still pulled up (point/maxval)
+        assert st['n_ps'] == 1 and st['n_ign'] == 1, variant
+    # only ignore-only points: plain GaussianMSE outside the disk, nothing inside
+    crit = PseudoGaussianMSE('gauss', r=0, r_ignore=0, r_ignore_only=4)
+    loss, st = crit(x, gt, KERNEL, pseudo_tensor([[15.0, 10.0, -1.0]]))
+    w = torch.ones(H, W)
+    for dr, dc in disk_offsets(4, 'cpu').tolist():
+        w[15 + dr, 10 + dc] = 0
+    ref = (w * (x[0, 0] - GaussianMSE()._traget_transform(x, gt, KERNEL)[0, 0]) ** 2).sum() / (H * W)
+    assert torch.allclose(loss, ref)
+    # r_ignore_only = 0 -> ignore-only points have no effect at all
+    crit = PseudoGaussianMSE('gauss', r=0, r_ignore=0, r_ignore_only=0)
+    loss, _ = crit(x, gt, KERNEL, pseudo_tensor([[15.0, 10.0, -1.0]]))
+    assert torch.allclose(loss, GaussianMSE()(x, gt, KERNEL))
 
 
 if __name__ == '__main__':

@@ -40,7 +40,8 @@ def ps_r_ignore(args):
 
 def pseudo_cfg(args):
     return {'alpha': args.ps_alpha, 'alpha_const': args.ps_alpha_const, 'views_k': args.ps_views_k,
-            'min_score': args.ps_min_score, 'min_views': args.ps_min_views}
+            'min_score': args.ps_min_score, 'min_views': args.ps_min_views,
+            'min_view_ratio': args.ps_min_view_ratio, 'ignore_min_views': args.ps_ignore_min_views}
 
 
 def pseudo_tag(args):
@@ -52,6 +53,10 @@ def pseudo_tag(args):
         tag += f'_ms{args.ps_min_score:g}'
     if args.ps_min_views > 1:
         tag += f'_mv{args.ps_min_views}'
+    if args.ps_min_view_ratio > 0:
+        tag += f'_vr{args.ps_min_view_ratio:g}'
+    if args.ps_ignore_min_views > 0:
+        tag += f'_ig{args.ps_ignore_min_views}r{args.ps_ignore_r:g}'
     return tag + '_' + os.path.basename(os.path.normpath(args.pseudo_dir))
 
 
@@ -59,7 +64,8 @@ def build_criterion(args, model=None):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'  # cpu only for local smoke tests
     if args.loss == 'pseudo':
         # kept labels as in GaussianMSE + pseudo labels from a 2D detector -- see PSEUDO_LABEL.md
-        return PseudoGaussianMSE(variant=args.ps_variant, r=args.ps_r, r_ignore=ps_r_ignore(args)).to(device)
+        return PseudoGaussianMSE(variant=args.ps_variant, r=args.ps_r, r_ignore=ps_r_ignore(args),
+                                 r_ignore_only=args.ps_ignore_r).to(device)
     if args.loss == 'mal':
         # missing-annotation robust loss -- see MISSING_ANNOTATION_LOSS.md and
         # multiview_detector/loss/missing_annotation_loss.py. Needs the model for the BEV->view warp.
@@ -312,6 +318,13 @@ if __name__ == '__main__':
     parser.add_argument('--ps_views_k', type=int, default=3)
     parser.add_argument('--ps_min_score', type=float, default=0.0, help='drop pseudo points with a lower score')
     parser.add_argument('--ps_min_views', type=int, default=1, help='drop pseudo points seen by fewer cameras')
+    parser.add_argument('--ps_min_view_ratio', type=float, default=0.0,
+                        help='positive only if n_views / n_visible >= this (cameras that detect it / that can see it)')
+    parser.add_argument('--ps_ignore_min_views', type=int, default=0,
+                        help='3-tier pseudo: points failing the positive filters but with n_views >= this become '
+                             'IGNORE regions (neither positive nor background); 0 = off (they are background)')
+    parser.add_argument('--ps_ignore_r', type=float, default=10.0,
+                        help='radius (output cells) of the weight-0 disk around an ignore-only point')
     parser.add_argument('--ps_lambda', type=float, default=1.0, help='lambda_max of the pseudo term')
     parser.add_argument('--ps_warmup', type=int, default=0, help='epochs with lambda_ps = 0')
     parser.add_argument('--ps_ramp', type=int, default=1, help='epochs of linear ramp to lambda_max after warm-up')

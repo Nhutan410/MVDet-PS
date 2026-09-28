@@ -78,13 +78,13 @@ class PerspectiveTrainer(BaseTrainer):
         with open(os.path.join(self.logdir, fname), 'a') as f:
             f.write(json.dumps(record) + '\n')
 
-    PS_KEYS = ('l_gt', 'l_ps', 'l_view', 'n_ps', 'p_at_ps', 'alpha_mean', 'ignored_frac')
+    PS_KEYS = ('l_gt', 'l_ps', 'l_view', 'n_ps', 'p_at_ps', 'alpha_mean', 'ignored_frac', 'n_ign')
 
     def _ps_str(self, ps_s):
         if not self.is_pseudo or ps_s['l_gt'].count == 0:
             return ''
         return (', lam_ps: {:.2f}, L_gt: {:.5f}, L_ps: {:.5f}, L_view: {:.5f}, n_ps: {:.1f}, P@ps: {:.3f}, '
-                'alpha: {:.3f}, ignored: {:.4f}'.format(self.criterion.lam, *(ps_s[k].avg for k in self.PS_KEYS)))
+                'alpha: {:.3f}, ignored: {:.4f}, n_ign: {:.1f}'.format(self.criterion.lam, *(ps_s[k].avg for k in self.PS_KEYS)))
 
     def train(self, epoch, data_loader, optimizer, log_interval=100, cyclic_scheduler=None):
         self.model.train()
