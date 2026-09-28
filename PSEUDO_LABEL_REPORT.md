@@ -1,11 +1,12 @@
 # MVDet + Pseudo Label khi thiếu nhãn (WildTrack drop60): toàn bộ quá trình và kết quả
 
-> **Branch này (`pseudo-label-clean`)** là bản **refactor tối giản** trên code gốc
+> **Branch này (`pseudo-label`)** là bản **refactor tối giản** trên code gốc
 > [hou-yz/MVDet](https://github.com/hou-yz/MVDet), commit `8b4792f`. Nó chỉ chứa những thay đổi **cần thiết** để
-> (1) chạy được trên Kaggle hoặc Python mới và (2) hiện thực phương pháp pseudo label. Toàn bộ thí nghiệm trong tài
-> liệu này được chạy bằng branch `pseudo-label`, vốn còn chứa các hướng đã thử và bỏ (loss `mal`, `confuse`,
-> `hetero`). Phần pseudo label của hai branch **giống hệt nhau về hành vi**: cùng file loss, cùng tool, cùng flag, cùng
-> giá trị mặc định (mục 1.3).
+> (1) chạy được trên Kaggle hoặc Python mới và (2) hiện thực phương pháp pseudo label. Các thí nghiệm trong tài liệu
+> này được chạy bằng phiên bản code **trước** khi refactor, lưu ở tag
+> [`pseudo-label-experiments`](https://github.com/Nhutan410/MVDet-PS/tree/pseudo-label-experiments) (commit
+> `12918cd`), vốn còn chứa các hướng đã thử và bỏ (loss `mal`, `confuse`, `hetero`). Phần pseudo label của hai phiên
+> bản **giống hệt nhau về hành vi**, đã được kiểm chứng (mục 1.3).
 >
 > **Kết quả chính:** với WildTrack chỉ còn **40% nhãn** (drop60), MVDet gốc đạt **MODA 22.7%**. Thêm pseudo label từ
 > một detector 2D có sẵn, cộng hai bộ lọc (bỏ vùng mép, đồng thuận ≥ 3 camera) và tầng "bỏ qua", MODA lên
@@ -63,7 +64,7 @@ Tỉ lệ lấy lại khoảng cách giữa baseline và full nhãn, tính bằn
 - **Không đổi** kiến trúc model, optimizer, lịch learning rate, cách suy luận (ngưỡng → NMS), cách đánh giá.
 - Với `--loss mse` (mặc định), chương trình chạy **giống hệt code gốc**. Log chỉ nằm thêm một cấp thư mục `mse/`.
 - Không giữ các hướng đã thử và bỏ (loss `mal`, `confuse`, `hetero`), không giữ tính năng tự dò đường dẫn Kaggle, NaN
-  guard hay log VRAM. Những thứ đó vẫn còn ở branch `pseudo-label`.
+  guard hay log VRAM. Những thứ đó vẫn còn ở tag `pseudo-label-experiments`.
 
 ### 1.2. Danh sách thay đổi
 
@@ -98,15 +99,19 @@ Tỉ lệ lấy lại khoảng cách giữa baseline và full nhãn, tính bằn
 Tổng phần sửa trong code gốc (`main.py` và `multiview_detector/`, không tính file mới): 6 file, 277 dòng thêm,
 40 dòng xóa. Xem đầy đủ bằng `git diff 8b4792f -- main.py multiview_detector`.
 
-### 1.3. Tương đương với branch `pseudo-label`
+### 1.3. Tương đương với code đã chạy thí nghiệm (tag `pseudo-label-experiments`)
 
-- Các file loss, tool và test giống hệt branch `pseudo-label`. Ngoại lệ duy nhất là tên file tài liệu được nhắc
-  trong docstring.
-- `load_pseudo` (dataset) được chép nguyên văn.
-- Tên flag, giá trị mặc định và tên thư mục log (`pseudo_tag`) giống hệt.
+Đã kiểm tra trước khi thay branch:
+- Các file loss, tool và test giống hệt. Ngoại lệ duy nhất là tên file tài liệu được nhắc trong docstring.
+- `load_pseudo` (dataset), `pseudo_cfg`, `ps_r_ignore`, `lambda_ps` giống hệt; `pseudo_tag` chỉ thêm một docstring.
+- Mọi flag `--ps_*` và `--loss` có cùng giá trị mặc định; loss được tạo với cùng tham số.
+- Chạy lại các tool trên cùng dữ liệu: file pseudo sinh ra **giống từng byte**, số liệu đánh giá và sweep ngưỡng
+  **trùng khớp**.
+- Khác biệt duy nhất về hành vi: code thí nghiệm có NaN guard (bỏ qua bước train nếu loss hoặc gradient không hữu hạn).
+  Branch này không có. Điều này không làm thay đổi kết quả khi không xảy ra NaN, và log của các run đã báo cáo
+  không có dấu hiệu NaN.
 
-Vì vậy các notebook Kaggle bên dưới chạy được với branch này **chỉ bằng cách đổi** `REPO_BRANCH = 'pseudo-label-clean'`
-ở Bước 2 của notebook.
+Các notebook Kaggle clone branch `pseudo-label`, tức chính branch này, nên chạy được mà không cần sửa.
 
 ---
 
@@ -372,7 +377,7 @@ Dataset mini gồm 2 frame train và 1 frame test. Kiểm tra cả `--loss mse` 
 - chạy trọn luồng: nạp pseudo, train, test, tính MODA, ghi `pseudo_stats.jsonl`;
 - tầng bỏ qua và bộ lọc mép hoạt động đúng (log: `12 positive + 61 ignore-only ..., border 40: 26 dropped`).
 
-Branch `pseudo-label-clean` cũng đã được kiểm tra lại như trên trước khi push.
+Branch này cũng đã được kiểm tra lại như trên (unit test, smoke test, các tool) trước khi push.
 
 ---
 
@@ -381,7 +386,7 @@ Branch `pseudo-label-clean` cũng đã được kiểm tra lại như trên trư
 ### 7.1. Chuẩn bị
 
 ```bash
-git clone -b pseudo-label-clean https://github.com/Nhutan410/MVDet-PS.git && cd MVDet-PS
+git clone -b pseudo-label https://github.com/Nhutan410/MVDet-PS.git && cd MVDet-PS
 pip install kornia opencv-python scipy
 # ~/Data/Wildtrack: Image_subsets/, calibrations/, annotations_positions/ (bản drop60 để train với thiếu nhãn)
 ```
@@ -443,8 +448,7 @@ python -m tools.pseudo.make_oracle --full_ann ... --kept_ann ... --noise_r 20 --
 
 ### 7.5. Trên Kaggle (cách các thí nghiệm đã được chạy)
 
-Notebook nằm trong repo capstone `notebooks/mvdet/`. Muốn dùng branch này thì sửa `REPO_BRANCH = 'pseudo-label-clean'`
-ở Bước 2.
+Notebook nằm trong repo capstone `notebooks/mvdet/`. Chúng clone branch `pseudo-label` (chính là branch này).
 
 | Notebook | Việc | Input | Thời gian |
 |---|---|---|---|
