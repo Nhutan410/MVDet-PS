@@ -154,15 +154,21 @@ class frameDataset(VisionDataset):
     def load_pseudo(self, pseudo_dir, cfg):
         """<pseudo_dir>/<frame:08d>.json from tools/pseudo (grid = full-res [gx, gy], same convention as the
         annotations). cfg: alpha ('const' | 'score' | 'views'), alpha_const, views_k, min_score, min_views,
-        min_view_ratio, ignore_min_views.
+        min_view_ratio, ignore_min_views, border.
 
         Three tiers per point: POSITIVE (passes min_score / min_views / min_view_ratio, or "tier": "pos" in the
         json) -> row alpha > 0; IGNORE (fails them but n_views >= ignore_min_views > 0, or "tier": "ign") -> row
-        alpha = -1, the loss neither pushes it up nor treats it as background; otherwise dropped (background)."""
+        alpha = -1, the loss neither pushes it up nor treats it as background; otherwise dropped (background).
+        Points closer than `border` full-res grid cells to the edge of the annotated area are always dropped: most
+        projection ghosts are people standing just outside it, so they must stay background (not even ignore)."""
         mode, a_const = cfg.get('alpha', 'const'), cfg.get('alpha_const', 0.5)
         views_k, min_score, min_views = cfg.get('views_k', 3), cfg.get('min_score', 0.0), cfg.get('min_views', 1)
         min_view_ratio, ignore_min_views = cfg.get('min_view_ratio', 0.0), cfg.get('ignore_min_views', 0)
-        self.pseudo, missing, n_raw, alphas, n_ign = {}, 0, 0, [], 0
+        border = cfg.get('border', 0.0)
+        # extent of the grid along gx / gy (same convention as the annotations)
+        sx, sy = (self.worldgrid_shape[1], self.worldgrid_shape[0]) if self.base.indexing == 'xy' else \
+            (self.worldgrid_shape[0], self.worldgrid_shape[1])
+        self.pseudo, missing, n_raw, alphas, n_ign, n_border = {}, 0, 0, [], 0, 0
         for frame in self.map_gt:
             fpath = os.path.join(pseudo_dir, f'{frame:08d}.json')
             if not os.path.isfile(fpath):
@@ -174,6 +180,10 @@ class frameDataset(VisionDataset):
             n_raw += len(pts)
             rows = []
             for p in pts:
+                gx, gy = p['grid']
+                if border > 0 and min(gx, sx - 1 - gx, gy, sy - 1 - gy) < border:
+                    n_border += 1
+                    continue
                 if 'tier' in p:
                     tier = p['tier']
                 else:
@@ -197,7 +207,6 @@ class frameDataset(VisionDataset):
                     alpha = p['score'] * min(1.0, p['n_views'] / max(1, min(views_k, p.get('n_visible', views_k))))
                 else:
                     raise ValueError(mode)
-                gx, gy = p['grid']
                 # same index convention as download(): row/col on the reduced map (float, floored in the loss)
                 if self.base.indexing == 'xy':
                     rows.append([gy / self.grid_reduce, gx / self.grid_reduce, alpha])
@@ -213,7 +222,8 @@ class frameDataset(VisionDataset):
         n, nf = len(alphas), max(len(self.pseudo), 1)
         print(f'[pseudo] {pseudo_dir}: {n_raw} points -> {n} positive ({n / nf:.1f}/frame) + {n_ign} ignore-only '
               f'({n_ign / nf:.1f}/frame) over {len(self.pseudo)} train frames (min_score {min_score}, min_views '
-              f'{min_views}, min_view_ratio {min_view_ratio}, ignore_min_views {ignore_min_views}), '
+              f'{min_views}, min_view_ratio {min_view_ratio}, ignore_min_views {ignore_min_views}, border {border}: '
+              f'{n_border} dropped), '
               f'alpha={mode} mean {np.mean(alphas) if alphas else 0:.3f}, frames without file: {missing}')
 
     def __getitem__(self, index):

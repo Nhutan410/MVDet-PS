@@ -41,7 +41,8 @@ def ps_r_ignore(args):
 def pseudo_cfg(args):
     return {'alpha': args.ps_alpha, 'alpha_const': args.ps_alpha_const, 'views_k': args.ps_views_k,
             'min_score': args.ps_min_score, 'min_views': args.ps_min_views,
-            'min_view_ratio': args.ps_min_view_ratio, 'ignore_min_views': args.ps_ignore_min_views}
+            'min_view_ratio': args.ps_min_view_ratio, 'ignore_min_views': args.ps_ignore_min_views,
+            'border': args.ps_border * 4}  # output cells -> full-res grid cells (grid_reduce 4)
 
 
 def pseudo_tag(args):
@@ -57,6 +58,8 @@ def pseudo_tag(args):
         tag += f'_vr{args.ps_min_view_ratio:g}'
     if args.ps_ignore_min_views > 0:
         tag += f'_ig{args.ps_ignore_min_views}r{args.ps_ignore_r:g}'
+    if args.ps_border > 0:
+        tag += f'_b{args.ps_border:g}'
     return tag + '_' + os.path.basename(os.path.normpath(args.pseudo_dir))
 
 
@@ -325,6 +328,9 @@ if __name__ == '__main__':
                              'IGNORE regions (neither positive nor background); 0 = off (they are background)')
     parser.add_argument('--ps_ignore_r', type=float, default=10.0,
                         help='radius (output cells) of the weight-0 disk around an ignore-only point')
+    parser.add_argument('--ps_border', type=float, default=0.0,
+                        help='drop pseudo points closer than this (output cells, 10 = 1 m) to the edge of the '
+                             'annotated area -- they stay background (most projection ghosts are there)')
     parser.add_argument('--ps_lambda', type=float, default=1.0, help='lambda_max of the pseudo term')
     parser.add_argument('--ps_warmup', type=int, default=0, help='epochs with lambda_ps = 0')
     parser.add_argument('--ps_ramp', type=int, default=1, help='epochs of linear ramp to lambda_max after warm-up')
