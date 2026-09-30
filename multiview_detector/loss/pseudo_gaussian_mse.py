@@ -51,13 +51,21 @@ class PseudoGaussianMSE(nn.Module):
     Ignore-only points (alpha < 0 rows, the uncertain tier): no positive target at all, only a weight-0 disk of
     radius r_ignore_only (default: the Gaussian support + location error) -- the model is neither taught that a
     person is there nor punished for predicting one.
+
+    Optional background recalibration (BRL, MSE form of BRLFocalLoss_v2; off when brl_beta = 0): among the pixels
+    that are still trained as background (weight > 0, not a pseudo target, soft GT of the kept labels < brl_pos_thr,
+    optionally outside a brl_border band of output cells), those the model predicts >= brl_conf_thr (detached) are
+    "confuse" -- possible unlabelled people -- and get brl_beta * (P - 1)^2 instead of (P - 0)^2.
     """
 
-    def __init__(self, variant='gauss', r=0.0, r_ignore=0.0, bg_eps=1e-2, r_ignore_only=10.0):
+    def __init__(self, variant='gauss', r=0.0, r_ignore=0.0, bg_eps=1e-2, r_ignore_only=10.0,
+                 brl_beta=0.0, brl_conf_thr=0.3, brl_pos_thr=0.1, brl_border=0.0):
         super().__init__()
         assert variant in VARIANTS, variant
         self.variant, self.r, self.r_ignore, self.bg_eps = variant, float(r), float(r_ignore), bg_eps
         self.r_ignore_only = float(r_ignore_only)
+        self.brl_beta, self.brl_conf_thr, self.brl_pos_thr = float(brl_beta), float(brl_conf_thr), float(brl_pos_thr)
+        self.brl_border = int(brl_border)
         self.lam = 1.0
 
     def _traget_transform(self, x, target, kernel):
@@ -74,6 +82,26 @@ class PseudoGaussianMSE(nn.Module):
         idx_c = torch.stack([idx[..., 0].clamp(0, H - 1), idx[..., 1].clamp(0, W - 1)], -1)
         vals = P[idx_c[..., 0], idx_c[..., 1]].masked_fill(~valid, float('-inf'))
         return vals, idx_c, valid
+
+    def _confuse(self, P, S, w, exclude=None):
+        """BRL confuse mask (None when BRL is off); assignment uses the detached prediction"""
+        if self.brl_beta <= 0:
+            return None
+        m = (S < self.brl_pos_thr) & (w > 0) & (P.detach() >= self.brl_conf_thr)
+        if exclude is not None:
+            m = m & ~exclude
+        if self.brl_border > 0:
+            b, (H, W) = self.brl_border, P.shape
+            inner = torch.zeros_like(m)
+            inner[b:H - b, b:W - b] = True
+            m = m & inner
+        return m
+
+    def _bg_split(self, P, w, sq, C):
+        """(background term, BRL term) sums; C = confuse mask or None"""
+        if C is None:
+            return (w * sq).sum(), P.new_zeros(())
+        return (w * sq * ~C).sum(), self.brl_beta * (C * (P - 1) ** 2).sum()
 
     @staticmethod
     def _anchor(pos, H, W):
@@ -102,7 +130,8 @@ class PseudoGaussianMSE(nn.Module):
         pad = int((kernel.shape[-1] - 1) / 2)
         kernel_mass = (kernel ** 2).sum()
         total = x.new_zeros(())
-        st = {'l_gt': 0., 'l_ps': 0., 'n_ps': 0., 'n_ign': 0., 'p_at_ps': 0., 'alpha_mean': 0., 'ignored_frac': 0.}
+        st = {'l_gt': 0., 'l_ps': 0., 'n_ps': 0., 'n_ign': 0., 'p_at_ps': 0., 'alpha_mean': 0., 'ignored_frac': 0.,
+              'l_brl': 0., 'confuse_frac': 0.}
         n_with_ps, n_frac = 0, 0
         for b in range(B):
             P, S = x[b, 0], soft_gt[b, 0]
@@ -122,9 +151,13 @@ class PseudoGaussianMSE(nn.Module):
                 ign[idx[..., 0][valid], idx[..., 1][valid]] = True
             w = w.masked_fill(ign & ~gt_region, 0.)
             if len(pts) == 0:
-                l_gt = (w * (P - S) ** 2).sum() / (H * W)
-                total = total + l_gt
+                C = self._confuse(P, S, w)
+                l_gt, l_brl = self._bg_split(P, w, (P - S) ** 2, C)
+                l_gt, l_brl = l_gt / (H * W), l_brl / (H * W)
+                total = total + l_gt + l_brl
                 st['l_gt'] += l_gt.item()
+                st['l_brl'] += l_brl.item()
+                st['confuse_frac'] += C.float().mean().item() if C is not None else 0.
                 if len(ign_pts):
                     st['ignored_frac'] += (w == 0).float().mean().item()
                     n_frac += 1
@@ -138,13 +171,18 @@ class PseudoGaussianMSE(nn.Module):
                 T, A = T[0], T[1] / T[0].clamp_min(1e-12)  # A = alpha of the pseudo point(s) covering the pixel
                 ps_region = (T > self.bg_eps) & ~gt_region
                 sq = (P - (S + T)) ** 2
-                l_gt = (w * sq * ~ps_region).sum() / (H * W)
+                C = self._confuse(P, S, w, exclude=ps_region)
+                l_gt, l_brl = self._bg_split(P, w * ~ps_region, sq, C)
                 l_ps = (A * sq * ps_region).sum() / (H * W)
             else:  # point / maxval
                 w = w.index_put((c[:, 0], c[:, 1]), torch.zeros_like(alpha))
-                l_gt = (w * (P - S) ** 2).sum() / (H * W)
+                C = self._confuse(P, S, w)
+                l_gt, l_brl = self._bg_split(P, w, (P - S) ** 2, C)
                 l_ps = (alpha * kernel_mass * (P[c[:, 0], c[:, 1]] - 1) ** 2).sum() / (H * W)
-            total = total + l_gt + self.lam * l_ps
+            l_gt, l_brl = l_gt / (H * W), l_brl / (H * W)
+            total = total + l_gt + self.lam * l_ps + l_brl
+            st['l_brl'] += l_brl.item()
+            st['confuse_frac'] += C.float().mean().item() if C is not None else 0.
             n_with_ps += 1
             st['l_gt'] += l_gt.item()
             st['l_ps'] += l_ps.item()
@@ -153,7 +191,7 @@ class PseudoGaussianMSE(nn.Module):
             st['alpha_mean'] += alpha.mean().item()
             st['ignored_frac'] += (w == 0).float().mean().item()
             n_frac += 1
-        for k in ('l_gt', 'l_ps', 'n_ps', 'n_ign'):
+        for k in ('l_gt', 'l_ps', 'n_ps', 'n_ign', 'l_brl', 'confuse_frac'):
             st[k] /= B
         for k in ('p_at_ps', 'alpha_mean'):
             st[k] = st[k] / n_with_ps if n_with_ps else float('nan')

@@ -11,7 +11,9 @@ They pin down the design of the pseudo-label loss:
   * maxval / mil follow the argmax of P inside the disk, point / maxval touch a single pixel,
   * ignore disk: no gradient on background near a pseudo point, kept labels untouched,
   * lambda = 0 removes every pseudo gradient,
-  * ignore-only points (alpha < 0): weight-0 disk, no positive target.
+  * ignore-only points (alpha < 0): weight-0 disk, no positive target,
+  * BRL (MSE form): confuse background pixels pulled towards 1, never on labels / pseudo / border band,
+  * per-view ignore boxes: unlabelled people get weight 0 in the head/foot loss, kept peaks are kept.
 """
 import os
 import sys
@@ -186,6 +188,60 @@ def test_ignore_only_points():
     crit = PseudoGaussianMSE('gauss', r=0, r_ignore=0, r_ignore_only=0)
     loss, _ = crit(x, gt, KERNEL, pseudo_tensor([[15.0, 10.0, -1.0]]))
     assert torch.allclose(loss, GaussianMSE()(x, gt, KERNEL))
+
+
+def test_brl_confuse_pixels():
+    empty = gt_map([(5, 5)])
+    x = torch.full((1, 1, H, W), 0.05)
+    x[0, 0, 20, 30] = 0.8   # confident background prediction far from any label -> confuse
+    x[0, 0, 1, 1] = 0.8     # same, but inside the border band
+    x[0, 0, 15, 12] = 0.8   # inside a pseudo target -> never confuse
+    x.requires_grad_(True)
+    ps = pseudo_tensor([[15.0, 12.0, 1.0]])
+    ref, _ = PseudoGaussianMSE('gauss', r=0, r_ignore=0)(x, empty, KERNEL, ps)
+    off, _ = PseudoGaussianMSE('gauss', r=0, r_ignore=0, brl_beta=0.0)(x, empty, KERNEL, ps)
+    assert torch.allclose(ref, off)  # brl_beta = 0 is exactly the loss without BRL
+    crit = PseudoGaussianMSE('gauss', r=0, r_ignore=0, brl_beta=0.1, brl_conf_thr=0.3, brl_pos_thr=0.1, brl_border=3)
+    loss, st = crit(x, empty, KERNEL, ps)
+    g, = torch.autograd.grad(loss, x)
+    assert g[0, 0, 20, 30] < 0          # confuse: pulled up towards 1 (beta * (P - 1)^2)
+    assert g[0, 0, 1, 1] > 0            # border band: still background, pushed down
+    assert g[0, 0, 10, 10] > 0          # low prediction: ordinary background
+    expected = 0.1 * (0.8 - 1) ** 2 / (H * W)
+    assert abs(st['l_brl'] - expected) < 1e-7, (st['l_brl'], expected)
+    # no pseudo points in the frame: BRL still applies
+    loss, st = crit(x, empty, KERNEL, torch.zeros(1, 0, 3))
+    assert st['l_brl'] > 0
+    # a kept label is never confuse (soft GT >= pos_thr)
+    x2 = torch.full((1, 1, H, W), 0.9, requires_grad=True)
+    _, st2 = PseudoGaussianMSE('gauss', r=0, r_ignore=0, brl_beta=0.1)(x2, empty, KERNEL, torch.zeros(1, 0, 3))
+    n_conf = st2['confuse_frac'] * H * W
+    S = GaussianMSE()._traget_transform(x2, empty, KERNEL)[0, 0]
+    assert abs(n_conf - (S < 0.1).sum().item()) < 1e-3
+
+
+def test_view_ignore_img_loss():
+    from multiview_detector.trainer import PerspectiveTrainer
+    tr = object.__new__(PerspectiveTrainer)
+    tr.img_criterion = GaussianMSE()
+    img_kernel = torch.zeros(2, 2, 9, 9)
+    img_kernel[0, 0] = KERNEL[0, 0]
+    img_kernel[1, 1] = KERNEL[0, 0]
+    gt = torch.zeros(1, 2, H, W)
+    gt[0, 0, 5, 5] = 1   # head of a kept person
+    gt[0, 1, 9, 5] = 1   # foot of a kept person
+    x = torch.rand(1, 2, H, W, requires_grad=True)
+    ref = GaussianMSE()(x, gt, img_kernel)
+    no_ign = tr._img_loss(x, gt, img_kernel, torch.zeros(1, H, W, dtype=torch.bool))
+    assert torch.allclose(ref, no_ign)
+    ign = torch.zeros(1, H, W, dtype=torch.bool)
+    ign[0, 0:12, 0:12] = True    # a detector box around the kept person ...
+    ign[0, 15:25, 20:30] = True  # ... and one around an unlabelled person
+    loss = tr._img_loss(x, gt, img_kernel, ign)
+    g, = torch.autograd.grad(loss, x)
+    assert g[0, 0, 20, 25] == 0 and g[0, 1, 20, 25] == 0   # unlabelled person: not taught "no person"
+    assert g[0, 0, 5, 5] != 0 and g[0, 1, 9, 5] != 0       # kept person's head / foot peaks still trained
+    assert g[0, 0, 28, 5] != 0                             # background outside boxes still trained
 
 
 if __name__ == '__main__':

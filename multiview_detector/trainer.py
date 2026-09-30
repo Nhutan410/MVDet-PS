@@ -21,7 +21,8 @@ class BaseTrainer(object):
 
 
 class PerspectiveTrainer(BaseTrainer):
-    PS_KEYS = ('l_gt', 'l_ps', 'l_view', 'n_ps', 'n_ign', 'p_at_ps', 'alpha_mean', 'ignored_frac')
+    PS_KEYS = ('l_gt', 'l_ps', 'l_view', 'n_ps', 'n_ign', 'p_at_ps', 'alpha_mean', 'ignored_frac', 'l_brl',
+               'confuse_frac', 'view_ign_frac')
 
     def __init__(self, model, criterion, logdir, denormalize, cls_thres=0.4, alpha=1.0, ps_schedule=(1.0, 0, 1)):
         super(BaseTrainer, self).__init__()
@@ -44,25 +45,37 @@ class PerspectiveTrainer(BaseTrainer):
             return 0.0
         return self.ps_lam_max * min(1.0, (e - self.ps_warmup + 1) / max(self.ps_ramp, 1))
 
-    def _loss(self, map_res, imgs_res, map_gt, imgs_gt, dataset, pseudo=None):
+    def _img_loss(self, img_res, img_gt, kernel, ign=None):
+        """per-view head/foot GaussianMSE; ign (B, h, w) bool: background pixels inside a detector box get weight 0
+        (the head/foot peaks of kept labels keep weight 1)"""
+        if ign is None:
+            return self.img_criterion(img_res, img_gt, kernel)
+        target = self.img_criterion._traget_transform(img_res, img_gt, kernel)
+        w = 1.0 - (ign[:, None].to(img_res.device) & (target < 1e-2)).float()
+        return (w * (img_res - target) ** 2).mean()
+
+    def _loss(self, map_res, imgs_res, map_gt, imgs_gt, dataset, pseudo=None, view_ign=None):
         """original MVDet loss; with pseudo labels also returns the per-term stats (else None)"""
         img_loss = 0
-        for img_res, img_gt in zip(imgs_res, imgs_gt):
-            img_loss += self.img_criterion(img_res, img_gt.to(img_res.device), dataset.img_kernel)
+        for cam, (img_res, img_gt) in enumerate(zip(imgs_res, imgs_gt)):
+            img_loss += self._img_loss(img_res, img_gt.to(img_res.device), dataset.img_kernel,
+                                       None if view_ign is None else view_ign[:, cam])
         img_loss = img_loss / len(imgs_gt) * self.alpha
         if not self.is_pseudo:
             return self.criterion(map_res, map_gt.to(map_res.device), dataset.map_kernel) + img_loss, None
         map_loss, st = self.criterion(map_res, map_gt.to(map_res.device), dataset.map_kernel, pseudo)
         if st is not None:
             st['l_view'] = img_loss.item()
+            if view_ign is not None:
+                st['view_ign_frac'] = view_ign.float().mean().item()
         return map_loss + img_loss, st
 
     def _ps_str(self, ps_s):
         if not self.is_pseudo or ps_s['l_gt'].count == 0:
             return ''
         return (', lam_ps: {:.2f}, L_gt: {:.5f}, L_ps: {:.5f}, L_view: {:.5f}, n_ps: {:.1f}, n_ign: {:.1f}, '
-                'P@ps: {:.3f}, alpha: {:.3f}, ignored: {:.4f}'.format(self.criterion.lam,
-                                                                      *(ps_s[k].avg for k in self.PS_KEYS)))
+                'P@ps: {:.3f}, alpha: {:.3f}, ignored: {:.4f}, L_brl: {:.5f}, confuse: {:.4f}, view_ign: {:.3f}'.format(
+                    self.criterion.lam, *(ps_s[k].avg for k in self.PS_KEYS)))
 
     def train(self, epoch, data_loader, optimizer, log_interval=100, cyclic_scheduler=None):
         self.model.train()
@@ -80,11 +93,12 @@ class PerspectiveTrainer(BaseTrainer):
         for batch_idx, batch in enumerate(data_loader):
             data, map_gt, imgs_gt = batch[:3]
             pseudo = batch[4] if len(batch) > 4 else None
+            view_ign = batch[5] if len(batch) > 5 else None
             optimizer.zero_grad()
             map_res, imgs_res = self.model(data)
             t_f = time.time()
             t_forward += t_f - t_b
-            loss, st = self._loss(map_res, imgs_res, map_gt, imgs_gt, data_loader.dataset, pseudo)
+            loss, st = self._loss(map_res, imgs_res, map_gt, imgs_gt, data_loader.dataset, pseudo, view_ign)
             loss.backward()
             optimizer.step()
             losses += loss.item()

@@ -12,7 +12,7 @@ from multiview_detector.utils.projection import *
 class frameDataset(VisionDataset):
     def __init__(self, base, train=True, transform=ToTensor(), target_transform=ToTensor(),
                  reID=False, grid_reduce=4, img_reduce=4, train_ratio=0.9, force_download=True,
-                 pseudo_dir=None, pseudo_cfg=None):
+                 pseudo_dir=None, pseudo_cfg=None, view_ignore_dets=None, view_ignore_score=0.5):
         super().__init__(base.root, transform=transform, target_transform=target_transform)
 
         map_sigma, map_kernel_size = 20 / grid_reduce, 20
@@ -47,6 +47,13 @@ class frameDataset(VisionDataset):
         if pseudo_dir is not None:
             assert train, 'pseudo labels are only ever used on the train split'
             self.load_pseudo(pseudo_dir, pseudo_cfg or {})
+
+        # per-view ignore boxes (train split only): 2D detector boxes (score >= view_ignore_score) whose background
+        # pixels get weight 0 in the per-view head/foot loss -- unlabelled people are not taught as "no person"
+        self.view_ignore = None
+        if view_ignore_dets is not None:
+            assert train, 'view-ignore boxes are only ever used on the train split'
+            self.load_view_ignore(view_ignore_dets, view_ignore_score)
 
         x, y = np.meshgrid(np.arange(-map_kernel_size, map_kernel_size + 1),
                            np.arange(-map_kernel_size, map_kernel_size + 1))
@@ -207,6 +214,33 @@ class frameDataset(VisionDataset):
               f'{n_border} dropped), '
               f'alpha={mode} mean {np.mean(alphas) if alphas else 0:.3f}, frames without file: {missing}')
 
+    def load_view_ignore(self, dets_json, min_score):
+        """dets_json: tools/pseudo/detect_2d.py output {"dets": {frame: [[cam, x1, y1, x2, y2, score], ...]}}"""
+        with open(dets_json) as f:
+            dets = json.load(f)['dets']
+        self.view_ignore, n = {}, 0
+        for frame in self.map_gt:
+            boxes = [[] for _ in range(self.num_cam)]
+            for cam, x1, y1, x2, y2, score in dets.get(str(frame), []):
+                if score >= min_score:
+                    boxes[int(cam)].append((x1, y1, x2, y2))
+                    n += 1
+            self.view_ignore[frame] = boxes
+        print(f'[view-ignore] {dets_json}: {n} boxes (score >= {min_score}) over {len(self.view_ignore)} train frames '
+              f'({n / max(len(self.view_ignore) * self.num_cam, 1):.1f}/image)')
+
+    def view_ignore_mask(self, frame):
+        """(num_cam, H / img_reduce, W / img_reduce) bool: True inside a detector box"""
+        h, w = self.img_shape[0] // self.img_reduce, self.img_shape[1] // self.img_reduce
+        m = torch.zeros(self.num_cam, h, w, dtype=torch.bool)
+        for cam, boxes in enumerate(self.view_ignore[frame]):
+            for x1, y1, x2, y2 in boxes:
+                c1, r1 = max(int(x1 // self.img_reduce), 0), max(int(y1 // self.img_reduce), 0)
+                c2, r2 = min(int(np.ceil(x2 / self.img_reduce)), w), min(int(np.ceil(y2 / self.img_reduce)), h)
+                if c2 > c1 and r2 > r1:
+                    m[cam, r1:r2, c1:c2] = True
+        return m
+
     def __getitem__(self, index):
         frame = list(self.map_gt.keys())[index]
         imgs = []
@@ -232,9 +266,12 @@ class frameDataset(VisionDataset):
             if self.target_transform is not None:
                 img_gt = self.target_transform(img_gt)
             imgs_gt.append(img_gt.float())
-        if self.pseudo is not None:
-            return imgs, map_gt.float(), imgs_gt, frame, torch.from_numpy(self.pseudo[frame])
-        return imgs, map_gt.float(), imgs_gt, frame
+        extra = []
+        if self.pseudo is not None or self.view_ignore is not None:
+            extra.append(torch.from_numpy(self.pseudo[frame]) if self.pseudo is not None else torch.zeros(0, 3))
+        if self.view_ignore is not None:
+            extra.append(self.view_ignore_mask(frame))
+        return (imgs, map_gt.float(), imgs_gt, frame, *extra)
 
     def __len__(self):
         return len(self.map_gt.keys())

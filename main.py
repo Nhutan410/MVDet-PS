@@ -50,6 +50,12 @@ def pseudo_tag(args):
         tag += f'_ig{args.ps_ignore_min_views}r{args.ps_ignore_r:g}'
     if args.ps_border > 0:
         tag += f'_b{args.ps_border:g}'
+    if args.brl_beta > 0:
+        tag += f'_brl{args.brl_beta:g}c{args.brl_conf_thr:g}p{args.brl_pos_thr:g}'
+        if args.brl_border > 0:
+            tag += f'bd{args.brl_border:g}'
+    if args.view_ignore_dets:
+        tag += '_vi' + (f'{args.view_ignore_score:g}' if args.view_ignore_score != 0.5 else '')
     return tag + '_' + os.path.basename(os.path.normpath(args.pseudo_dir))
 
 
@@ -82,8 +88,12 @@ def main(args):
         if args.batch_size != 1:
             raise Exception('--loss pseudo: pseudo points differ in number per frame, use --batch_size 1')
         train_set = frameDataset(base, train=True, transform=train_trans, grid_reduce=4,
-                                 pseudo_dir=os.path.expanduser(args.pseudo_dir), pseudo_cfg=pseudo_cfg(args))
+                                 pseudo_dir=os.path.expanduser(args.pseudo_dir), pseudo_cfg=pseudo_cfg(args),
+                                 view_ignore_dets=os.path.expanduser(args.view_ignore_dets) if args.view_ignore_dets
+                                 else None, view_ignore_score=args.view_ignore_score)
     else:
+        if args.view_ignore_dets or args.brl_beta > 0:
+            raise Exception('--view_ignore_dets / --brl_beta are options of --loss pseudo')
         train_set = frameDataset(base, train=True, transform=train_trans, grid_reduce=4)
     test_set = frameDataset(base, train=False, transform=train_trans, grid_reduce=4)
 
@@ -113,7 +123,9 @@ def main(args):
     if args.loss == 'pseudo':
         # kept labels as in GaussianMSE + pseudo labels from a 2D detector
         criterion = PseudoGaussianMSE(variant=args.ps_variant, r=args.ps_r, r_ignore=ps_r_ignore(args),
-                                      r_ignore_only=args.ps_ignore_r).to(device)
+                                      r_ignore_only=args.ps_ignore_r, brl_beta=args.brl_beta,
+                                      brl_conf_thr=args.brl_conf_thr, brl_pos_thr=args.brl_pos_thr,
+                                      brl_border=args.brl_border).to(device)
         loss_tag = pseudo_tag(args)
     else:
         criterion = GaussianMSE().to(device)
@@ -229,6 +241,19 @@ if __name__ == '__main__':
                         help='drop pseudo points closer than this (output cells, 10 = 1 m) to the edge of the '
                              'annotated area -- they stay background (most projection ghosts are there)')
     parser.add_argument('--ps_lambda', type=float, default=1.0, help='lambda_max of the pseudo term')
+    # background recalibration (MSE form of BRLFocalLoss_v2), on top of the pseudo loss; off when brl_beta = 0
+    parser.add_argument('--brl_beta', type=float, default=0.0,
+                        help='weight of beta * (P - 1)^2 on confuse pixels; 0 = off')
+    parser.add_argument('--brl_conf_thr', type=float, default=0.3,
+                        help='background pixel with prediction >= this (detached) is confuse')
+    parser.add_argument('--brl_pos_thr', type=float, default=0.1,
+                        help='pixels with soft GT (kept labels) >= this are never confuse')
+    parser.add_argument('--brl_border', type=float, default=0.0,
+                        help='no confuse pixels within this many output cells of the map edge (10 = 1 m); 0 = off')
+    # per-view head/foot loss: ignore 2D detector boxes (unlabelled people are not taught as "no person")
+    parser.add_argument('--view_ignore_dets', type=str, default=None,
+                        help='detect_2d.py json; background pixels inside its boxes get weight 0 in the per-view loss')
+    parser.add_argument('--view_ignore_score', type=float, default=0.5)
     parser.add_argument('--ps_warmup', type=int, default=0, help='epochs with lambda_ps = 0')
     parser.add_argument('--ps_ramp', type=int, default=1, help='epochs of linear ramp to lambda_max after warm-up')
     args = parser.parse_args()
