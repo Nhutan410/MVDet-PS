@@ -22,7 +22,7 @@ from tools.pseudo.common import list_frames, load_base
 COCO_PERSON = 1  # torchvision COCO label id
 
 
-def build_detector(name, device):
+def build_detector(name, device, imgsz=1280):
     if name == 'frcnn_v2':
         from torchvision.models.detection import (FasterRCNN_ResNet50_FPN_V2_Weights,
                                                   fasterrcnn_resnet50_fpn_v2)
@@ -42,13 +42,13 @@ def build_detector(name, device):
             return res
         return run
     if name.startswith('yolo'):
-        # e.g. --detector yolo:yolo11x.pt   (needs `pip install ultralytics`)
+        # e.g. --detector yolo:yolo26s.pt   (needs `pip install ultralytics`); person class only, at --imgsz
         from ultralytics import YOLO
-        model = YOLO(name.split(':', 1)[1] if ':' in name else 'yolo11x.pt')
+        model = YOLO(name.split(':', 1)[1] if ':' in name else 'yolo26s.pt')
 
         def run(imgs):
             res = []
-            for r in model.predict(imgs, classes=[0], conf=0.01, iou=0.6, verbose=False, device=device):
+            for r in model.predict(imgs, classes=[0], conf=0.01, iou=0.6, imgsz=imgsz, verbose=False, device=device):
                 b = r.boxes
                 res.append(np.concatenate([b.xyxy.cpu().numpy(), b.conf.cpu().numpy()[:, None]], 1))
             return res
@@ -64,7 +64,7 @@ def main(args):
         frames = frames[:args.max_frames]
     img_fpaths = base.get_image_fpaths(frames)
     device = args.device or ('cuda' if torch.cuda.is_available() else 'cpu')
-    run = build_detector(args.detector, device)
+    run = build_detector(args.detector, device, args.imgsz)
     print(f'{args.detector} on {device}: {len(frames)} frames x {base.num_cam} cams, split={args.split}')
 
     jobs = [(frame, cam) for frame in frames for cam in range(base.num_cam)]
@@ -102,4 +102,5 @@ if __name__ == '__main__':
     p.add_argument('--batch', type=int, default=4)
     p.add_argument('--max_frames', type=int, default=0, help='debug: only the first N frames')
     p.add_argument('--device', default=None)
+    p.add_argument('--imgsz', type=int, default=1280, help='YOLO inference size (Faster R-CNN uses the full image)')
     main(p.parse_args())
